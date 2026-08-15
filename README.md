@@ -6,6 +6,9 @@ A reproducible rebuild of the hand-patched vLLM engine that serves
 link. It contains everything needed to reconstruct the *software* from a public
 base image plus the host-side scripts that launch and drive it.
 
+This code and stack was pretty much entirely put together by AI, I probably can not help too much outside of prompting my agent.
+PRs are welcome for performance improvements.
+
 ## Performance
 
 Single-stream, TP=2 across the two boxes over Thunderbolt RDMA, with the
