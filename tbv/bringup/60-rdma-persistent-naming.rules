@@ -1,0 +1,6 @@
+# tbv: empty override of /usr/lib/udev/rules.d/60-rdma-persistent-naming.rules.
+# Stock rule renames RDMA devices (usb4_rdma* -> rocep*) at boot, racing the
+# tbv-reload-roce.sh rename and colliding with the driver's deterministic
+# per-rail names. When the tbv rails are a box's only RDMA devices, persistent
+# naming is unwanted.
+# Delete this file to restore stock behavior.

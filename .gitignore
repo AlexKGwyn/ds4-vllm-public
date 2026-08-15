@@ -1,0 +1,24 @@
+# regenerable / runtime artifacts
+__pycache__/
+*.pyc
+*.log
+*.out
+*.orig
+*.bak
+*.bak_*
+# capture + sweep outputs (large, regenerable) — data only, not *_proxy.py sources
+host/bench/*.jsonl
+host/bench/*_capture*.json
+host/moe_tune/runs/
+ray-tmp/
+# kernel module build artifacts (rebuilt per kernel)
+tbv/**/*.ko
+tbv/**/*.o
+tbv/**/*.mod
+tbv/**/*.mod.c
+tbv/**/*.cmd
+tbv/**/.*.cmd
+tbv/**/Module.symvers
+tbv/**/modules.order
+host/bench/perf_ab/results/
+__pycache__/

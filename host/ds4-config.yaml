@@ -1,0 +1,18 @@
+# Site configuration for the DS4 vLLM cluster.
+# Deployed as ~/ds4-config.yaml on box1 (the ray head); the cluster scripts
+# read it via `eval "$("$HOME/ds4-config")"`. Flat key: value only -- parsed
+# by ds4-config with the Python stdlib, no pyyaml.
+model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id (auto-downloaded to the HF cache) or a local path; weights needed on BOTH boxes
+transport: rdma        # rdma | tcp -- which ds4-cluster-env.<transport>.sh the cluster sources
+head_ip: 192.168.100.1
+worker_ip: 192.168.100.2
+container: vllm        # podman container name (same on both boxes)
+rdma_hca: usb4_rdma0   # NCCL_IB_HCA pin, rdma transport only (the tbv bring-up names the rail usb4_rdma0)
+api_port: 1234
+disk_kv: true          # NVMe prefix-KV tier (fs_lru); prefixes survive restarts
+disk_kv_gib: 30        # per-NODE disk cap; check df on BOTH boxes before raising
+max_ctx: 524288        # --max-model-len (512K, the validated profile)
+kv_pin_gib: 6          # pinned GPU KV pool; sized against MemAvailable, not grown by max_ctx
+gpu_mem_util: 0.83     # vLLM --gpu-memory-utilization; IGNORED while the KV pin above is set
+warmup_ctx: 2048       # post-start warmup prefill size (JIT kernels + bf16 weight cache + first prefill-indexer buckets; deeper buckets are cheap on first use); 0 disables
+cables: 1              # Thunderbolt cables between the boxes: 1 works; 2 dedicates the second NHI to the RX zero-copy rail (tbv/install-modules.sh reads this)

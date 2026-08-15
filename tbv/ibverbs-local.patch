@@ -1,0 +1,3453 @@
+Base commit: 76ba39b630a70accb72f19388eefe48844b50eb8
+Remote: https://github.com/hellas-ai/thunderbolt-ibverbs
+
+--- a/kernel/debugfs.c
++++ b/kernel/debugfs.c
+@@ -475,6 +475,33 @@
+ 				   rail->path.rx_supp_poll_enabled,
+ 				   atomic64_read(&rail->path.rx_supp_poll_calls),
+ 				   atomic64_read(&rail->path.rx_supp_poll_completed));
++			seq_printf(s,
++				   "    zc rings_ready=%u negotiated=%u remote_enabled=%u state=%s attempts=%u remote_out=%d tx_credits=%u/%u\n",
++				   rail->zc_rings_ready,
++				   rail->zc_negotiated,
++				   rail->zc_remote_enabled,
++				   tbv_path_state_name(rail->zc_path.state),
++				   rail->zc_attempts,
++				   rail->zc_remote_transmit_path,
++				   rail->zc_path.tx_remote_data_credits,
++				   rail->zc_path.tx_remote_data_credit_max);
++			seq_printf(s,
++				   "    zc_tx streams=%lld enqueued=%lld posted=%lld completed=%lld credit_stalls=%lld credit_received=%lld\n",
++				   atomic64_read(&rail->zc_path.zc_tx_streams),
++				   atomic64_read(&rail->zc_path.data_tx_enqueued),
++				   atomic64_read(&rail->zc_path.data_tx_posted),
++				   atomic64_read(&rail->zc_path.data_tx_completed),
++				   atomic64_read(&rail->zc_path.data_tx_credit_stalls),
++				   atomic64_read(&rail->zc_path.data_tx_credit_received));
++			seq_printf(s,
++				   "    zc_rx streams=%lld placed=%lld bounced=%lld bad_frame=%lld stream_errors=%lld credit_send_error=%lld credit_pending=%u\n",
++				   atomic64_read(&rail->zc_path.zc_rx_streams),
++				   atomic64_read(&rail->zc_path.zc_rx_placed),
++				   atomic64_read(&rail->zc_path.zc_rx_bounced),
++				   atomic64_read(&rail->zc_path.zc_rx_bad_frame),
++				   atomic64_read(&rail->zc_path.zc_rx_stream_errors),
++				   atomic64_read(&rail->zc_path.zc_credit_send_error),
++				   rail->zc_path.zc_credit_pending);
+ 		}
+ 	}
+ 	mutex_unlock(&state->lock);
+--- a/kernel/ibdev.c
++++ b/kernel/ibdev.c
+@@ -29,6 +29,11 @@
+ #include <rdma/ib_cache.h>
+ #include <rdma/ib_mad.h>
+ #include <rdma/ib_umem.h>
++#include <linux/dma-buf.h>
++#include <linux/iosys-map.h>
++
++/* dma_buf_vmap/vunmap_unlocked live in the DMA_BUF symbol namespace. */
++MODULE_IMPORT_NS("DMA_BUF");
+ #include <rdma/ib_user_verbs.h>
+ #include <rdma/ib_verbs.h>
+ 
+@@ -96,6 +101,26 @@
+ MODULE_PARM_DESC(zcopy_min_bytes,
+ 		 "Minimum native bytes before raw zero-copy streaming is requested; retryable native RC WRITE falls back to framed copies");
+ 
++/*
++ * Option A (DRAFT, off by default): per-fragment header-framed zero-copy for RC
++ * WRITE. Requires BOTH peers to run a build that understands
++ * TBV_NATIVE_DATA_F_SPLIT_PAYLOAD. Leave 0 for single-node reloads.
++ */
++static bool native_rc_split_zcopy;
++module_param(native_rc_split_zcopy, bool, 0644);
++MODULE_PARM_DESC(native_rc_split_zcopy,
++		 "DRAFT/2-node: emit RC WRITE as [header frame + zero-copy payload frame] pairs instead of framed copies. Both peers must support F_SPLIT_PAYLOAD");
++
++static uint native_rc_split_chunk_frames = 16;
++module_param(native_rc_split_chunk_frames, uint, 0644);
++MODULE_PARM_DESC(native_rc_split_chunk_frames,
++		 "Max zero-copy payload frames covered by one split header (1-64)");
++
++static uint native_rc_split_min_bytes = 8192;
++module_param(native_rc_split_min_bytes, uint, 0644);
++MODULE_PARM_DESC(native_rc_split_min_bytes,
++		 "Min RC WRITE size for the split zero-copy path; smaller writes use the copied fastpath (single-frame messages cannot amortize the split header)");
++
+ static uint qp_timeout_ms = TBV_QP_TIMEOUT_DEFAULT_MS;
+ module_param(qp_timeout_ms, uint, 0644);
+ MODULE_PARM_DESC(qp_timeout_ms,
+@@ -327,6 +352,12 @@
+ 	struct list_head node;
+ 	u32 offset;
+ 	u32 len;
++	/*
++	 * Zero-copy WRITE fragment: the payload already sits in the
++	 * destination MR (placed by the NHI); data[] is empty and delivery
++	 * only does the bookkeeping.
++	 */
++	bool placed;
+ 	u8 data[];
+ };
+ 
+@@ -477,6 +508,22 @@
+ 	int access;
+ 	bool closing;
+ 	bool dma_mr;
++	/*
++	 * Backed by a dma-buf import (e.g. an amdgpu GTT buffer) pinned and
++	 * DMA-mapped for the NHI ring device rather than by process VA pages.
++	 * A pinned dma-buf umem only carries the DMA view of the sg_table
++	 * (nents; orig_nents stays 0) — CPU page walks over it are invalid.
++	 * The exporter's vmap provides the kernel VA for the copy paths.
++	 */
++	bool dmabuf;
++	/*
++	 * All DMA sg entries of this dma-buf mapping are 4K-multiples, so any
++	 * 4K-aligned offset into it yields whole-4K zero-copy chunks (the
++	 * canonical raw-stream shape the zc RX engine posts descriptors for).
++	 * Computed once at registration.
++	 */
++	bool zc_sg_4k;
++	struct iosys_map dmabuf_map;
+ };
+ 
+ struct tbv_ah {
+@@ -631,6 +678,8 @@
+ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+ 				   struct page **page_out,
+ 				   u32 *page_off_out, u32 *len_out);
++static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
++				  dma_addr_t *dma_out, u32 *len_out);
+ static int tbv_rx_copy_to_wqe(struct tbv_state *state,
+ 			      const struct tbv_recv_wqe *wqe, u32 offset,
+ 			      const void *payload, u32 len, u32 *delivered);
+@@ -832,8 +881,24 @@
+ 	return mr;
+ }
+ 
++/*
++ * Kernel VA for MR-space address `addr` in a dma-buf MR. The vmap covers
++ * the whole exported buffer; umem->address is the registration offset into
++ * it and mr->start anchors the MR's address space (== iova for dma-buf MRs).
++ * Callers must have bounds-checked addr against the MR already.
++ */
++static void *tbv_mr_dmabuf_ptr(const struct tbv_mr *mr, u64 addr)
++{
++	return (u8 *)mr->dmabuf_map.vaddr + mr->umem->address +
++	       (addr - mr->start);
++}
++
+ static void tbv_mr_free(struct tbv_mr *mr)
+ {
++	if (mr->dmabuf && mr->dmabuf_map.vaddr)
++		dma_buf_vunmap_unlocked(
++			to_ib_umem_dmabuf(mr->umem)->attach->dmabuf,
++			&mr->dmabuf_map);
+ 	if (mr->umem)
+ 		ib_umem_release(mr->umem);
+ 	if (mr->owner)
+@@ -1748,9 +1813,13 @@
+ 		/*
+ 		 * Without native SEND striping, a send_ctx's QP is pinned to
+ 		 * exactly one rail and that rail's path is the only place this
+-		 * send_ctx could have been queued for TX.
++		 * send_ctx could have been queued for TX — plus the rail's zc
++		 * payload path, where raw WRITE stream payload may be queued
++		 * (possibly credit-stalled; leaving it would wedge the
++		 * payload-only FIFO head-of-line).
+ 		 */
+ 		tbv_path_cancel_data_owner_ctx(&tqp->rail->path, send);
++		tbv_path_cancel_data_owner_ctx(&tqp->rail->zc_path, send);
+ 		return;
+ 	}
+ 
+@@ -1761,11 +1830,16 @@
+ 
+ 	if (!path_count) {
+ 		tbv_path_cancel_data_owner_ctx(&tqp->rail->path, send);
++		tbv_path_cancel_data_owner_ctx(&tqp->rail->zc_path, send);
+ 		return;
+ 	}
+ 
+-	for (i = 0; i < path_count; i++)
++	for (i = 0; i < path_count; i++) {
+ 		tbv_path_cancel_data_owner_ctx(paths[i], send);
++		if (paths[i]->rail)
++			tbv_path_cancel_data_owner_ctx(&paths[i]->rail->zc_path,
++						       send);
++	}
+ 	tbv_release_path_refs(paths, path_count);
+ }
+ 
+@@ -4043,9 +4117,18 @@
+ 			seg_off = offset - skipped;
+ 
+ 		chunk = min_t(u32, seg->length - seg_off, length - copied);
+-		ret = ib_umem_copy_from((u8 *)dst + copied, seg->mr->umem,
+-					seg->addr + seg_off - seg->mr->start,
+-					chunk);
++		if (seg->mr->dmabuf) {
++			memcpy((u8 *)dst + copied,
++			       tbv_mr_dmabuf_ptr(seg->mr, seg->addr + seg_off),
++			       chunk);
++			ret = 0;
++		} else {
++			ret = ib_umem_copy_from((u8 *)dst + copied,
++						seg->mr->umem,
++						seg->addr + seg_off -
++						seg->mr->start,
++						chunk);
++		}
+ 		if (ret)
+ 			return ret;
+ 		copied += chunk;
+@@ -4268,7 +4351,8 @@
+ }
+ 
+ static int tbv_send_page_stream_next(void *ctx, struct page **page,
+-				     u32 *page_off, u32 *length,
++				     u32 *page_off, dma_addr_t *dma,
++				     u32 *length,
+ 				     tbv_path_tx_done_fn *done,
+ 				     void **done_ctx)
+ {
+@@ -4292,9 +4376,20 @@
+ 		remaining = min_t(u32, seg->length - seg_off,
+ 				  stream->total_len - stream->offset);
+ 		remaining = min_t(u32, remaining, stream->max_chunk);
+-		ret = tbv_umem_page_from_addr(seg->mr, seg->addr + seg_off,
+-					      remaining, page, page_off,
+-					      length);
++		if (seg->mr->dmabuf) {
++			/* pre-mapped for the NHI: yield the bus address */
++			*page = NULL;
++			*page_off = 0;
++			ret = tbv_umem_dma_from_addr(seg->mr,
++						     seg->addr + seg_off,
++						     remaining, dma, length);
++		} else {
++			*dma = 0;
++			ret = tbv_umem_page_from_addr(seg->mr,
++						      seg->addr + seg_off,
++						      remaining, page,
++						      page_off, length);
++		}
+ 		if (ret)
+ 			return ret;
+ 
+@@ -4364,6 +4459,18 @@
+ 
+ 			remaining = min_t(u32, seg->length - seg_off,
+ 					  total_len - offset);
++			if (seg->mr->dmabuf) {
++				/*
++				 * dma-buf MRs are zcopy-safe by construction:
++				 * pinned and DMA-mapped for the NHI at
++				 * registration (this IS the peer-direct
++				 * contract). Skip the page walk — there is
++				 * no CPU sg view to walk.
++				 */
++				offset += remaining;
++				found = true;
++				break;
++			}
+ 			ret = tbv_umem_page_from_addr(seg->mr,
+ 						      seg->addr + seg_off,
+ 						      remaining, &page,
+@@ -4385,6 +4492,41 @@
+ 	return true;
+ }
+ 
++/*
++ * Route this raw WRITE stream's payload onto the rail's zero-copy path?
++ * Requires the zc gate open on the rail AND a source layout that yields the
++ * canonical chunk shape the receiver posts descriptors for
++ * ([first, 4K, 4K, ..., tail]): a single dma-buf SGE that is either one
++ * contiguous DMA run or 4K-aligned over 4K-granular sg entries.
++ */
++static bool tbv_send_ctx_zc_path_eligible(struct tbv_send_ctx *ctx,
++					  struct tbv_path *path)
++{
++	struct tbv_send_segment *seg;
++	struct tbv_rail *rail = path->rail;
++	dma_addr_t dma;
++	u32 run_len;
++
++	if (!rail || !tbv_rail_zc_tx_ready(rail))
++		return false;
++	if (ctx->nsegs != 1)
++		return false;
++	seg = &ctx->segs[0];
++	if (!seg->mr->dmabuf)
++		return false;
++	if (tbv_umem_dma_from_addr(seg->mr, seg->addr,
++				   min_t(u32, ctx->total_len, U32_MAX),
++				   &dma, &run_len))
++		return false;
++	if (run_len >= ctx->total_len)
++		return true;
++	if (seg->mr->zc_sg_4k &&
++	    !((ib_umem_offset(seg->mr->umem) +
++	       (seg->addr - seg->mr->start)) & (SZ_4K - 1)))
++		return true;
++	return false;
++}
++
+ static bool tbv_send_ctx_is_send(const struct tbv_send_ctx *ctx)
+ {
+ 	return ctx->opcode == TBV_NATIVE_DATA_OP_SEND ||
+@@ -4434,6 +4576,133 @@
+ 	}
+ }
+ 
++/*
++ * TX-worker frame fill for the copied RC/host-memory datapath. Produces the
++ * 48B native header followed by the gathered MR payload directly into the
++ * pre-mapped ring staging buffer @dst, eliminating both the per-fragment
++ * kmalloc'd frame and the stage memcpy. Invoked from the path TX worker (see
++ * tbv_path_owned_frame::fill). The owning send ctx is kept alive by the
++ * in-flight packet's reference and ctx->segs stay valid across retransmits, so
++ * a (re)fill always reads consistent, still-owned source memory. The bytes
++ * written are identical to the old two-copy path — the wire format and the
++ * receiver are unchanged.
++ */
++static int tbv_send_frame_fill(void *fill_ctx, void *dst, u32 dst_len,
++			       u32 frag_offset, bool last)
++{
++	struct tbv_send_ctx *ctx = fill_ctx;
++	struct tbv_native_data_header hdr;
++	u32 payload_len;
++	int ret;
++
++	if (dst_len < TBV_NATIVE_DATA_HDR_SIZE)
++		return -EINVAL;
++	payload_len = dst_len - TBV_NATIVE_DATA_HDR_SIZE;
++
++	tbv_send_ctx_build_native_header(ctx, frag_offset, payload_len, last,
++					 &hdr);
++	ret = tbv_native_data_build_header(dst, dst_len, &hdr);
++	if (ret < 0)
++		return ret;
++
++	ret = tbv_copy_send_range(ctx->segs, ctx->nsegs, frag_offset,
++				  (u8 *)dst + TBV_NATIVE_DATA_HDR_SIZE,
++				  payload_len);
++	if (ret)
++		atomic64_inc(&ctx->tqp->owner->data_wr_copy_error);
++	return ret;
++}
++
++/*
++ * Option A (DRAFT) header fill: build one chunk's 48B header with
++ * F_SPLIT_PAYLOAD set and take that header frame's completion reference,
++ * symmetrically with tbv_send_page_stream_next() for the payload frame.
++ */
++static int tbv_send_split_hdr_prep(void *hdr_ctx, void *dst, u32 dst_len,
++				   u32 frag_offset, u32 chunk_len, bool last,
++				   tbv_path_tx_done_fn *done, void **done_ctx)
++{
++	struct tbv_send_page_stream *stream = hdr_ctx;
++	struct tbv_native_data_header hdr;
++	int ret;
++
++	if (dst_len < TBV_NATIVE_DATA_HDR_SIZE)
++		return -EINVAL;
++
++	tbv_send_ctx_build_native_header(stream->send, frag_offset, chunk_len,
++					 last, &hdr);
++	hdr.flags |= TBV_NATIVE_DATA_F_SPLIT_PAYLOAD;
++	ret = tbv_native_data_build_header(dst, dst_len, &hdr);
++	if (ret < 0)
++		return ret;
++
++	refcount_inc(&stream->refs);
++	atomic_inc(&stream->send->tx_pending);
++	tbv_send_ctx_get(stream->send);
++	*done = tbv_send_page_stream_done;
++	*done_ctx = stream;
++	return 0;
++}
++
++/*
++ * Option A (DRAFT, 2-node): try to emit an RC WRITE as [header, zero-copy
++ * payload] frame pairs. Returns -EOPNOTSUPP when the feature is disabled or the
++ * WR is ineligible, in which case the caller falls back to the copied path.
++ */
++static int tbv_native_send_ctx_post_split_zcopy(struct tbv_send_ctx *ctx)
++{
++	struct tbv_qp *tqp = ctx->tqp;
++	struct tbv_send_page_stream *stream;
++	struct tbv_path *path;
++	int ret;
++
++	if (!READ_ONCE(native_rc_split_zcopy))
++		return -EOPNOTSUPP;
++	if (!tbv_send_ctx_is_write(ctx) || !ctx->total_len)
++		return -EOPNOTSUPP;
++	/* Only worth it for multi-frame messages (tiny stays single-frame). */
++	if (ctx->total_len <= TBV_NATIVE_DATA_MAX_PAYLOAD)
++		return -EOPNOTSUPP;
++	/* Below the threshold the copied fastpath wins on descriptor count. */
++	if (ctx->total_len < READ_ONCE(native_rc_split_min_bytes))
++		return -EOPNOTSUPP;
++	/* Host-memory MRs only; dmabuf/GPU MRs keep their existing paths. */
++	if (!tbv_send_segments_zcopy_safe(ctx->segs, ctx->nsegs, ctx->total_len))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&tqp->owner->lock);
++	path = tbv_select_native_data_path_for_qp_locked(tqp);
++	mutex_unlock(&tqp->owner->lock);
++	if (!path) {
++		atomic64_inc(&tqp->owner->data_wr_no_path);
++		return -ENOTCONN;
++	}
++
++	stream = kzalloc(sizeof(*stream), GFP_KERNEL);
++	if (!stream) {
++		tbv_release_path_refs(&path, 1);
++		return -ENOMEM;
++	}
++	refcount_set(&stream->refs, 1);
++	stream->send = ctx;
++	stream->total_len = ctx->total_len;
++	stream->max_chunk = TBV_NATIVE_DATA_FRAME_SIZE;
++	stream->nsegs = ctx->nsegs;
++	tbv_get_send_segments(stream->segs, ctx->segs, ctx->nsegs);
++
++	atomic64_inc(&tqp->owner->data_wr_zcopy);
++	atomic64_inc(&tqp->owner->data_wr_path_send);
++	ret = tbv_path_send_split_write(path, ctx->total_len,
++					READ_ONCE(native_rc_split_chunk_frames),
++					0, tbv_send_page_stream_next, stream,
++					tbv_send_split_hdr_prep, stream);
++	tbv_release_path_refs(&path, 1);
++	tbv_send_page_stream_put(stream);
++	if (ret)
++		atomic64_inc(&tqp->owner->data_wr_path_send_error);
++	return ret;
++}
++
+ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
+ 					   enum tbv_send_post_reason reason)
+ {
+@@ -4494,6 +4763,7 @@
+ 
+ 	if (zcopy_requested && raw_zcopy_allowed && zcopy_safe) {
+ 		struct tbv_send_page_stream *stream;
++		struct tbv_path *payload_path = NULL;
+ 
+ 		if (reason == TBV_SEND_POST_INITIAL)
+ 			atomic64_inc(&tqp->owner->data_wr_zcopy);
+@@ -4508,6 +4778,9 @@
+ 			return -ENOTCONN;
+ 		}
+ 
++		if (tbv_send_ctx_zc_path_eligible(ctx, path))
++			payload_path = &path->rail->zc_path;
++
+ 		stream = kzalloc(sizeof(*stream), GFP_KERNEL);
+ 		if (!stream) {
+ 			tbv_release_path_refs(&path, 1);
+@@ -4524,7 +4797,8 @@
+ 		tbv_send_ctx_get(ctx);
+ 		atomic_inc(&ctx->tx_pending);
+ 		atomic64_inc(&tqp->owner->data_wr_path_send);
+-		ret = tbv_path_send_page_stream(path, &hdr, ctx->total_len, 0,
++		ret = tbv_path_send_page_stream(path, payload_path, &hdr,
++						ctx->total_len, 0,
+ 						tbv_send_tx_done, ctx,
+ 						tbv_send_page_stream_next,
+ 						stream);
+@@ -4539,6 +4813,18 @@
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Option A (DRAFT, 2-node): RC WRITE header-framed zero-copy. Inert
++	 * unless native_rc_split_zcopy is set AND the peer understands
++	 * F_SPLIT_PAYLOAD; -EOPNOTSUPP falls through to the copied path below.
++	 */
++	if (tbv_send_ctx_is_write(ctx)) {
++		ret = tbv_native_send_ctx_post_split_zcopy(ctx);
++		if (ret != -EOPNOTSUPP)
++			return ret;
++		ret = 0;
++	}
++
+ 	if (reason == TBV_SEND_POST_INITIAL) {
+ 		if (zcopy_requested) {
+ 			atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
+@@ -4604,42 +4890,27 @@
+ 			       (ctx->psn + frag_idx) % path_count : 0;
+ 		u32 packet_len = TBV_NATIVE_DATA_HDR_SIZE + payload_len;
+ 		struct tbv_path_owned_frame *owned;
+-		u8 *frame;
+-
+-		frame = kmalloc(packet_len, GFP_KERNEL);
+-		if (!frame) {
+-			ret = -ENOMEM;
+-			goto err_release_paths;
+-		}
+-
+-		ret = tbv_copy_send_range(ctx->segs, ctx->nsegs, offset,
+-					  frame + TBV_NATIVE_DATA_HDR_SIZE,
+-					  payload_len);
+-		if (ret) {
+-			kfree(frame);
+-			atomic64_inc(&tqp->owner->data_wr_copy_error);
+-			goto err_release_paths;
+-		}
+-
+-		tbv_send_ctx_build_native_header(ctx, offset, payload_len,
+-						 last, &hdr);
+-		ret = tbv_native_data_build_header(frame, packet_len, &hdr);
+-		if (ret < 0) {
+-			kfree(frame);
+-			goto err_release_paths;
+-		}
+ 
++		/*
++		 * Defer both the header build and the payload gather to TX
++		 * time: the frame is filled straight into the pre-mapped ring
++		 * buffer by tbv_send_frame_fill(), so there is no per-fragment
++		 * kmalloc and no stage memcpy (one copy total: MR -> ring).
++		 */
+ 		owned = kzalloc(sizeof(*owned), GFP_KERNEL);
+ 		if (!owned) {
+-			kfree(frame);
+ 			ret = -ENOMEM;
+ 			goto err_release_paths;
+ 		}
+ 		INIT_LIST_HEAD(&owned->node);
+-		owned->data = frame;
++		owned->data = NULL;
+ 		owned->len = packet_len;
+ 		owned->sof = TBV_DATA_PDF_FRAME_START;
+ 		owned->eof = TBV_DATA_PDF_FRAME_END;
++		owned->fill = tbv_send_frame_fill;
++		owned->fill_ctx = ctx;
++		owned->fill_offset = offset;
++		owned->fill_last = last;
+ 		list_add_tail(&owned->node, &frame_lists[path_idx]);
+ 		frame_counts[path_idx]++;
+ 
+@@ -5174,7 +5445,13 @@
+ 	ctx->imm_data = (send_with_imm || write_with_imm) ?
+ 			be32_to_cpu(wr->ex.imm_data) : 0;
+ 	ctx->solicited = !!(wr->send_flags & IB_SEND_SOLICITED);
+-	ctx->retryable = true;
++	/*
++	 * UC never retransmits (real UC semantics), which is also what makes
++	 * raw zero-copy streams safe on it: a retransmitted raw stream could
++	 * interleave with a receiver still consuming the first attempt (see
++	 * tbv_send_ctx_allows_raw_zcopy). RC keeps the retry engine.
++	 */
++	ctx->retryable = tqp->type != IB_QPT_UC;
+ 	ctx->max_retries = tbv_qp_send_max_retries(tqp);
+ 	ctx->max_rnr_retries = tbv_qp_send_max_rnr_retries(tqp);
+ 	ctx->recv_credit_required = recv_credit_required;
+@@ -6572,6 +6849,22 @@
+ 	if (addr < mr->start || end > mr_end)
+ 		return -EFAULT;
+ 
++	if (mr->dmabuf) {
++		memcpy(tbv_mr_dmabuf_ptr(mr, addr), src, len);
++		/*
++		 * The exporter's vmap of a GTT BO is write-combined; WC
++		 * stores are NOT ordered against the later cacheable
++		 * completion-flag write the peer spins on. Drain the WC
++		 * buffers before returning so a reader that observes the
++		 * flag (and a GPU kernel already queued behind it) cannot
++		 * see pre-drain payload. Missing this corrupts exactly
++		 * under tight pipelining (vLLM) while relaxed-timing tests
++		 * pass.
++		 */
++		wmb();
++		return 0;
++	}
++
+ 	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+ 	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
+ 				      offset);
+@@ -6635,9 +6928,118 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (mr->dmabuf) {
++		memcpy(dst, tbv_mr_dmabuf_ptr(mr, addr), len);
++		return 0;
++	}
+ 	return ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
+ }
+ 
++/*
++ * DMA-view sibling of tbv_umem_page_from_addr for dma-buf MRs: yield the
++ * pre-mapped NHI bus address covering MR-space `addr`, capped at max_len
++ * and the containing DMA segment. The pinned dma-buf umem was DMA-mapped
++ * for the NHI ring device at registration, so these addresses are directly
++ * usable as zero-copy TX frame buffers — no dma_map_page, no CPU touch.
++ */
++static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
++				  dma_addr_t *dma_out, u32 *len_out)
++{
++	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
++	struct scatterlist *sg;
++	u64 offset;
++	u64 end;
++	u64 mr_end;
++	unsigned int i;
++
++	if (!max_len)
++		return -EINVAL;
++	if (!mr->dmabuf)
++		return -EOPNOTSUPP;
++	if (check_add_overflow(addr, (u64)max_len, &end))
++		return -EINVAL;
++	if (check_add_overflow(mr->start, mr->length, &mr_end))
++		return -EINVAL;
++	if (addr < mr->start || end > mr_end)
++		return -EFAULT;
++
++	offset = ib_umem_offset(mr->umem) + (addr - mr->start);
++	for_each_sgtable_dma_sg(sgt, sg, i) {
++		u64 seg_len = sg_dma_len(sg);
++
++		if (offset >= seg_len) {
++			offset -= seg_len;
++			continue;
++		}
++		*dma_out = sg_dma_address(sg) + offset;
++		*len_out = (u32)min_t(u64, seg_len - offset, max_len);
++		return 0;
++	}
++	return -EFAULT;
++}
++
++/*
++ * Zero-copy RX engine services (called from path.c). A "stream handle" is a
++ * ref-held tbv_mr whose access and IOVA range were validated against the
++ * incoming raw-stream WRITE header; the reference pins the dma-buf mapping
++ * (ib_umem_release only runs at final put) so posted RX descriptors stay
++ * valid even if userspace deregisters the MR mid-stream.
++ */
++void *tbv_ibdev_zc_stream_begin(struct tbv_state *state,
++				const struct tbv_native_data_header *hdr)
++{
++	struct tbv_mr *mr;
++	u64 iova_end;
++	u64 mr_iova_end;
++
++	if (!state || !state->verbs_registered)
++		return NULL;
++	if (hdr->opcode != TBV_NATIVE_DATA_OP_RDMA_WRITE &&
++	    hdr->opcode != TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM)
++		return NULL;
++
++	mr = tbv_mr_get(state, hdr->rkey);
++	if (!mr)
++		return NULL;
++
++	if (!mr->dmabuf || !(mr->access & IB_ACCESS_REMOTE_WRITE) ||
++	    check_add_overflow(hdr->remote_addr, (u64)hdr->length,
++			       &iova_end) ||
++	    check_add_overflow(mr->virt_addr, mr->length, &mr_iova_end) ||
++	    hdr->remote_addr < mr->virt_addr || iova_end > mr_iova_end) {
++		tbv_mr_put(mr);
++		return NULL;
++	}
++
++	return mr;
++}
++
++int tbv_ibdev_zc_chunk_dma(void *mr_handle, u64 iova, u32 len,
++			   dma_addr_t *dma_out)
++{
++	struct tbv_mr *mr = mr_handle;
++	u64 addr;
++	u32 run_len;
++	int ret;
++
++	ret = tbv_umem_iova_to_addr(mr, iova, len, &addr);
++	if (ret)
++		return ret;
++	ret = tbv_umem_dma_from_addr(mr, addr, len, dma_out, &run_len);
++	if (ret)
++		return ret;
++	/* chunk crosses a DMA discontinuity: caller bounces this chunk */
++	if (run_len < len)
++		return -EFAULT;
++	return 0;
++}
++
++void tbv_ibdev_zc_stream_end(void *mr_handle)
++{
++	if (mr_handle)
++		tbv_mr_put(mr_handle);
++}
++
+ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+ 				   struct page **page_out,
+ 				   u32 *page_off_out, u32 *len_out)
+@@ -6653,6 +7055,13 @@
+ 		return -EINVAL;
+ 	if (mr->dma_mr)
+ 		return -EOPNOTSUPP;
++	/*
++	 * dma-buf umems have no CPU sg view (orig_nents == 0) — no struct
++	 * page walk is possible. Callers (the raw-zcopy pre-scan) treat this
++	 * as "not zcopy-safe" and take the vmap-backed copy path instead.
++	 */
++	if (mr->dmabuf)
++		return -EOPNOTSUPP;
+ 	if (check_add_overflow(addr, (u64)max_len, &end))
+ 		return -EINVAL;
+ 	if (check_add_overflow(mr->start, mr->length, &mr_end))
+@@ -6970,14 +7379,16 @@
+ 	    new_bytes > TBV_RX_REORDER_MAX_BYTES)
+ 		return -ENOSPC;
+ 
+-	frag = kmalloc(struct_size(frag, data, len), GFP_KERNEL);
++	frag = kmalloc(struct_size(frag, data, payload ? len : 0), GFP_KERNEL);
+ 	if (!frag)
+ 		return -ENOMEM;
+ 
+ 	INIT_LIST_HEAD(&frag->node);
+ 	frag->offset = offset;
+ 	frag->len = len;
+-	memcpy(frag->data, payload, len);
++	frag->placed = !payload;
++	if (payload)
++		memcpy(frag->data, payload, len);
+ 	list_add_tail(&frag->node, &msg->frags);
+ 
+ 	msg->buffered_bytes += len;
+@@ -6997,7 +7408,12 @@
+ 	list_for_each_entry(frag, &msg->frags, node) {
+ 		if (frag->offset != offset)
+ 			continue;
+-		return frag->len == len && !memcmp(frag->data, payload, len);
++		if (frag->len != len)
++			return false;
++		/* placed fragments carry no payload copy to compare */
++		if (frag->placed || !payload)
++			return true;
++		return !memcmp(frag->data, payload, len);
+ 	}
+ 
+ 	return false;
+@@ -7327,6 +7743,8 @@
+ 		list_for_each_entry(frag, &msg->frags, node) {
+ 			u64 copy_addr;
+ 
++			if (frag->placed)
++				continue;
+ 			if (check_add_overflow(msg->remote_addr,
+ 					       (u64)frag->offset,
+ 					       &copy_addr)) {
+@@ -8139,6 +8557,7 @@
+ 	u32 copy_len = hdr->length;
+ 	int ret;
+ 
++
+ 	if ((hdr->flags & ~(TBV_NATIVE_DATA_F_LAST |
+ 			    TBV_NATIVE_DATA_F_SOLICITED)) ||
+ 	    check_add_overflow((u64)hdr->frag_offset, (u64)hdr->length,
+@@ -8219,7 +8638,12 @@
+ 		if (offset < wrx->received) {
+ 			u32 duplicate = wrx->received - offset;
+ 
+-			if (duplicate >= hdr->length) {
++			/*
++			 * Placed (zero-copy) fragments only ever arrive once
++			 * (UC, no retransmit); a duplicate here means the
++			 * bookkeeping is off — drop it rather than replay.
++			 */
++			if (duplicate >= hdr->length || !payload) {
+ 				mutex_unlock(&tqp->rx_lock);
+ 				return;
+ 			}
+@@ -8292,7 +8716,7 @@
+ 		tbv_qp_schedule_timeout(tqp);
+ 	}
+ 
+-	if (copy_len) {
++	if (copy_len && copy_payload) {
+ 		if (check_add_overflow(wrx->remote_addr, (u64)copy_offset,
+ 				       &copy_addr)) {
+ 			atomic64_inc(&state->data_rx_copy_error);
+@@ -8331,6 +8755,14 @@
+ 		}
+ 
+ 		wrx->received = copy_offset + copy_len;
++	} else if (copy_len) {
++		/*
++		 * Zero-copy fragment (payload == NULL): the NHI already
++		 * placed the bytes in the destination MR — the MR was
++		 * resolved and range-checked when the zc RX engine posted
++		 * the descriptors. Only advance the bookkeeping.
++		 */
++		wrx->received = copy_offset + copy_len;
+ 	}
+ 	if (last) {
+ 		tbv_rx_finish_write_locked(state, tqp, rx_path,
+@@ -9093,6 +9525,38 @@
+ 	tbv_ibdev_rx_native_frame(state, rx_path, &hdr, payload);
+ }
+ 
++/*
++ * Option A receiver: a F_SPLIT_PAYLOAD header arrived earlier and was stashed;
++ * @payload/@len is the separate payload frame that immediately followed it on
++ * the same path. Validate the pairing, strip the transport-only SPLIT flag
++ * (the RDMA-write handler only accepts LAST|SOLICITED), and dispatch exactly as
++ * if the bytes had arrived contiguously after the header.
++ */
++void tbv_ibdev_rx_split_payload(struct tbv_state *state,
++				struct tbv_path *rx_path,
++				const struct tbv_native_data_header *hdr,
++				const void *payload, u32 len)
++{
++	struct tbv_native_data_header dispatch;
++
++	if (!state || !state->verbs_registered || !hdr)
++		return;
++	/* Only RDMA WRITE / WRITE_IMM use split payload today. */
++	if (hdr->opcode != TBV_NATIVE_DATA_OP_RDMA_WRITE &&
++	    hdr->opcode != TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM) {
++		atomic64_inc(&state->data_rx_bad_frame);
++		return;
++	}
++	if (!len || len > TBV_NATIVE_DATA_FRAME_SIZE || len != hdr->length) {
++		atomic64_inc(&state->data_rx_bad_frame);
++		return;
++	}
++
++	dispatch = *hdr;
++	dispatch.flags &= ~TBV_NATIVE_DATA_F_SPLIT_PAYLOAD;
++	tbv_ibdev_rx_native_frame(state, rx_path, &dispatch, payload);
++}
++
+ static int tbv_mr_publish(struct tbv_mr *mr, struct ib_pd *pd)
+ {
+ 	struct tbv_state *owner = tbv_ibdev_state(pd->device);
+@@ -9191,6 +9655,121 @@
+ 	return &mr->base;
+ }
+ 
++/*
++ * Register a dma-buf backed MR (e.g. a GPU buffer exported by amdgpu). This
++ * is the "peer-direct contract with the GPU driver" that tbv_page_zcopy_safe
++ * refers to: the exporter pins the buffer and hands us an sg_table that is
++ * DMA-mapped for the Thunderbolt NHI ring device, so frame DMA can target
++ * the exporter's pages directly. On UMA APUs (gfx1151) GPU buffers are
++ * GTT-backed ordinary system pages, so the existing page walks and copy
++ * helpers keep working on the imported sg_table.
++ */
++static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
++					    u64 length, u64 virt_addr,
++					    int fd, int access,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++					    struct ib_dmah *dmah,
++#endif
++					    struct uverbs_attr_bundle *attrs)
++{
++	struct tbv_ibdev *tdev = container_of(pd->device, struct tbv_ibdev,
++					      base);
++	struct ib_umem_dmabuf *umem_dmabuf;
++	struct device *dma_dev;
++	struct tbv_mr *mr;
++	int ret;
++
++	if (!length)
++		return ERR_PTR(-EINVAL);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++	if (dmah)
++		return ERR_PTR(-EOPNOTSUPP);
++#endif
++	if (!tdev->rail || !tdev->rail->path.tx_ring)
++		return ERR_PTR(-ENODEV);
++	dma_dev = tb_ring_dma_device(tdev->rail->path.tx_ring);
++	if (!tbv_dma_device_ready(dma_dev))
++		return ERR_PTR(-ENODEV);
++
++	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
++	if (!mr)
++		return ERR_PTR(-ENOMEM);
++
++	/*
++	 * This ib_device registers with a NULL dma_device (RDMA-core virtual
++	 * DMA), so the default dma-buf attach device would be meaningless.
++	 * Attach to the NHI ring DMA device instead — the device that
++	 * actually moves frames.
++	 */
++	umem_dmabuf = ib_umem_dmabuf_get_pinned_with_dma_device(pd->device,
++								dma_dev,
++								offset, length,
++								fd, access);
++	if (IS_ERR(umem_dmabuf)) {
++		ret = PTR_ERR(umem_dmabuf);
++		kfree(mr);
++		return ERR_PTR(ret);
++	}
++	mr->umem = &umem_dmabuf->umem;
++	mr->dmabuf = true;
++
++	{
++		struct sg_table *sgt = &mr->umem->sgt_append.sgt;
++		struct scatterlist *sg;
++		unsigned int i;
++		unsigned int last = sgt->nents - 1;
++
++		mr->zc_sg_4k = true;
++		for_each_sgtable_dma_sg(sgt, sg, i) {
++			if (i != last && (sg_dma_len(sg) & (SZ_4K - 1))) {
++				mr->zc_sg_4k = false;
++				break;
++			}
++		}
++	}
++
++	/*
++	 * Pinned dma-buf umems expose only the DMA-mapped sg view
++	 * (orig_nents == 0): sg_pcopy/ib_umem_copy_* walks see an empty
++	 * table. Map the buffer into the kernel via the exporter's vmap so
++	 * the copy paths have a CPU address. amdgpu GTT BOs vmap to plain
++	 * vaddr (not iomem) on UMA.
++	 */
++	ret = dma_buf_vmap_unlocked(umem_dmabuf->attach->dmabuf,
++				    &mr->dmabuf_map);
++	if (ret) {
++		ib_umem_release(mr->umem);
++		kfree(mr);
++		return ERR_PTR(ret);
++	}
++	if (mr->dmabuf_map.is_iomem) {
++		dma_buf_vunmap_unlocked(umem_dmabuf->attach->dmabuf,
++					&mr->dmabuf_map);
++		ib_umem_release(mr->umem);
++		kfree(mr);
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++
++	mr->base.type = IB_MR_TYPE_USER;
++	mr->base.iova = virt_addr;
++	mr->base.length = length;
++	/*
++	 * No process VA backs a dma-buf MR. Anchor start at the iova so the
++	 * start-relative and iova-relative helpers agree on offsets.
++	 */
++	mr->start = virt_addr;
++	mr->length = length;
++	mr->virt_addr = virt_addr;
++	mr->access = access;
++	ret = tbv_mr_publish(mr, pd);
++	if (ret) {
++		ib_umem_release(mr->umem);
++		kfree(mr);
++		return ERR_PTR(ret);
++	}
++	return &mr->base;
++}
++
+ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
+ {
+ 	struct tbv_mr *mr = container_of(ibmr, struct tbv_mr, base);
+@@ -9242,6 +9821,7 @@
+ 	.poll_cq = tbv_poll_cq,
+ 	.req_notify_cq = tbv_req_notify_cq,
+ 	.reg_user_mr = tbv_reg_user_mr,
++	.reg_user_mr_dmabuf = tbv_reg_user_mr_dmabuf,
+ 	.dereg_mr = tbv_dereg_mr,
+ 
+ 	INIT_RDMA_OBJ_SIZE(ib_ucontext, tbv_ucontext, base),
+@@ -9285,6 +9865,27 @@
+ 			    ((u64)rail->peer->peer_id << 24) +
+ 			    rail->rail_id);
+ 	dev->base.uverbs_cmd_mask |=
++		/* legacy write-command enablement for the standard verbs this
++		 * driver implements ops for. Some kernels do not populate the
++		 * default cmd_mask in _ib_alloc_device for driver-id UNKNOWN
++		 * devices, which left QUERY_DEVICE (and friends) disabled and
++		 * made ibv_query_device() return EOPNOTSUPP. Enable them here. */
++		BIT_ULL(IB_USER_VERBS_CMD_GET_CONTEXT) |
++		BIT_ULL(IB_USER_VERBS_CMD_QUERY_DEVICE) |
++		BIT_ULL(IB_USER_VERBS_CMD_QUERY_PORT) |
++		BIT_ULL(IB_USER_VERBS_CMD_ALLOC_PD) |
++		BIT_ULL(IB_USER_VERBS_CMD_DEALLOC_PD) |
++		BIT_ULL(IB_USER_VERBS_CMD_CREATE_AH) |
++		BIT_ULL(IB_USER_VERBS_CMD_DESTROY_AH) |
++		BIT_ULL(IB_USER_VERBS_CMD_REG_MR) |
++		BIT_ULL(IB_USER_VERBS_CMD_DEREG_MR) |
++		BIT_ULL(IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL) |
++		BIT_ULL(IB_USER_VERBS_CMD_CREATE_CQ) |
++		BIT_ULL(IB_USER_VERBS_CMD_DESTROY_CQ) |
++		BIT_ULL(IB_USER_VERBS_CMD_CREATE_QP) |
++		BIT_ULL(IB_USER_VERBS_CMD_QUERY_QP) |
++		BIT_ULL(IB_USER_VERBS_CMD_MODIFY_QP) |
++		BIT_ULL(IB_USER_VERBS_CMD_DESTROY_QP) |
+ 		BIT_ULL(IB_USER_VERBS_CMD_POST_SEND) |
+ 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) |
+ 		BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ) |
+@@ -9292,6 +9893,19 @@
+ 
+ 	ib_set_device_ops(&dev->base, &tbv_ibdev_ops);
+ 
++	/*
++	 * Stable rail identity for userspace device selection (device names
++	 * like usb4_rdma5 change across module reloads). zc=1 means this
++	 * rail's NHI had a free ring pair for the zero-copy payload path —
++	 * consumers that want GPU-direct RX (tbv_ar) pick a zc=1 device via
++	 * /sys/class/infiniband/<dev>/node_desc.
++	 */
++	snprintf(dev->base.node_desc, sizeof(dev->base.node_desc),
++		 "tbv peer%u rail%u zc=%u route=0x%llx",
++		 rail->peer->peer_id, rail->rail_id,
++		 rail->zc_rings_ready ? 1 : 0,
++		 (unsigned long long)rail->key.route);
++
+ 	dma_device = get_device(tb_ring_dma_device(rail->path.tx_ring));
+ 	dev->base.dev.parent = dma_device;
+ 	ret = tbv_ibdev_attach_netdev(dev);
+--- a/kernel/native_control.c
++++ b/kernel/native_control.c
+@@ -15,6 +15,7 @@
+ #define TBV_NATIVE_HELLO_RETRIES 5
+ #define TBV_NATIVE_TUNNEL_RETRIES 20
+ #define TBV_NATIVE_READY_RETRIES 10
++#define TBV_NATIVE_ZC_RETRIES 30
+ #define TBV_NATIVE_HELLO_TIMEOUT_MS 1000
+ #define TBV_NATIVE_HELLO_RETRY_DELAY_MS 200
+ #define TBV_NATIVE_HELLO_INITIAL_DELAY_MS 100
+@@ -55,6 +56,8 @@
+ {
+ 	memset(hello, 0, sizeof(*hello));
+ 	hello->capabilities = tbv_native_control_caps(state, peer);
++	if (rail->zc_rings_ready && tbv_path_zc_supported())
++		hello->capabilities |= TBV_NATIVE_WIRE_CAP_ZC_PATH;
+ 	hello->rail_id = rail->rail_id;
+ 	hello->route = rail->key.route;
+ 	hello->tx_hop = rail->path.tx_ring ?
+@@ -68,6 +71,27 @@
+ 	hello->path_flags = tbv_native_control_path_flags(&rail->path);
+ }
+ 
++/* ZC_HELLO/ZC_HELLO_ACK payload: same struct, the rail's zc path values. */
++static void tbv_native_control_fill_zc_hello(const struct tbv_rail *rail,
++					     struct tbv_native_wire_hello *hello)
++{
++	memset(hello, 0, sizeof(*hello));
++	hello->capabilities = TBV_NATIVE_WIRE_CAP_ZC_PATH;
++	if (rail->zc_path.state == TBV_PATH_TUNNEL_ENABLED)
++		hello->capabilities |= TBV_NATIVE_WIRE_CAP_ZC_ENABLED;
++	hello->rail_id = rail->rail_id;
++	hello->route = rail->key.route;
++	hello->tx_hop = rail->zc_path.tx_ring ?
++			rail->zc_path.tx_ring->hop : U32_MAX;
++	hello->rx_hop = rail->zc_path.rx_ring ?
++			rail->zc_path.rx_ring->hop : U32_MAX;
++	hello->transmit_path = rail->zc_path.local_transmit_path >= 0 ?
++			rail->zc_path.local_transmit_path : U32_MAX;
++	hello->tx_ring_size = rail->zc_path.cfg.tx_ring_size;
++	hello->rx_ring_size = rail->zc_path.cfg.rx_ring_size;
++	hello->path_flags = tbv_native_control_path_flags(&rail->zc_path);
++}
++
+ static bool tbv_native_control_peer_matches_source(
+ 	const struct tbv_peer *peer, const struct tb_xdomain *source_xd)
+ {
+@@ -230,6 +254,7 @@
+ 
+ 			rail->native_negotiated = true;
+ 			rail->remote_rail_id = remote->rail_id;
++			rail->remote_caps = remote->capabilities;
+ 			rail->remote_transmit_path = remote->transmit_path;
+ 			rail->remote_tx_hop = remote->tx_hop;
+ 			rail->remote_rx_hop = remote->rx_hop;
+@@ -254,6 +279,61 @@
+ 					       true);
+ }
+ 
++/*
++ * Store the peer's zc-path parameters (from a ZC_HELLO request or ack) on the
++ * matching rail. When reply_out/xd_out are given (request handler side), also
++ * snapshot our own zc hello for the ack and take an xdomain reference.
++ */
++static int tbv_native_control_apply_zc_remote(
++	struct tbv_state *state, const struct tb_xdomain *source_xd,
++	const struct tbv_native_wire_info *info,
++	const struct tbv_native_wire_hello *remote,
++	struct tbv_native_wire_hello *reply_out, struct tb_xdomain **xd_out)
++{
++	struct tbv_peer *peer;
++	int ret = -ENOENT;
++
++	mutex_lock(&state->lock);
++	list_for_each_entry(peer, &state->peers, node) {
++		struct tbv_rail *rail;
++
++		if (peer->backend != TBV_BACKEND_NATIVE)
++			continue;
++		if (!tbv_native_control_peer_matches_source(peer, source_xd))
++			continue;
++
++		list_for_each_entry(rail, &peer->rails, node) {
++			if (rail->key.route != info->route ||
++			    rail->rail_id != remote->rail_id)
++				continue;
++
++			if (remote->transmit_path != U32_MAX &&
++			    remote->rx_ring_size) {
++				rail->zc_remote_transmit_path =
++					remote->transmit_path;
++				rail->zc_remote_tx_hop = remote->tx_hop;
++				rail->zc_remote_rx_ring_size =
++					remote->rx_ring_size;
++				rail->zc_negotiated = true;
++			}
++			if (remote->capabilities &
++			    TBV_NATIVE_WIRE_CAP_ZC_ENABLED)
++				rail->zc_remote_enabled = true;
++			if (reply_out)
++				tbv_native_control_fill_zc_hello(rail,
++								 reply_out);
++			if (xd_out)
++				*xd_out = tb_xdomain_get(peer->xd);
++			ret = 0;
++			goto out;
++		}
++	}
++
++out:
++	mutex_unlock(&state->lock);
++	return ret;
++}
++
+ static int tbv_native_control_mark_remote_ready(struct tbv_state *state,
+ 						const struct tb_xdomain *source_xd,
+ 						const struct tbv_native_wire_info *info,
+@@ -392,6 +472,42 @@
+ 	if (info.op == TBV_NATIVE_WIRE_OP_READY_ACK)
+ 		return 0;
+ 
++	if (info.op == TBV_NATIVE_WIRE_OP_ZC_HELLO_ACK)
++		return 0;
++
++	if (info.op == TBV_NATIVE_WIRE_OP_ZC_HELLO) {
++		memset(&local, 0, sizeof(local));
++		ret = tbv_native_control_apply_zc_remote(state, source_xd,
++							 &info, &remote,
++							 &local, &xd);
++		if (ret) {
++			pr_warn_ratelimited("native ZC_HELLO route=0x%llx rail=0x%x has no matching peer rail\n",
++					    info.route, remote.rail_id);
++			return 1;
++		}
++
++		pr_info("native ZC_HELLO received route=0x%llx rail=0x%x remote_out=%u remote_enabled=%d\n",
++			info.route, remote.rail_id, remote.transmit_path,
++			!!(remote.capabilities &
++			   TBV_NATIVE_WIRE_CAP_ZC_ENABLED));
++
++		ret = tbv_native_wire_build_hello(reply, sizeof(reply), &local,
++						  TBV_NATIVE_WIRE_OP_ZC_HELLO_ACK,
++						  0, info.seq, local.route,
++						  info.xdomain_sequence);
++		if (ret >= 0)
++			ret = tb_xdomain_response(xd, reply, sizeof(reply),
++						  TB_CFG_PKG_XDOMAIN_RESP);
++		if (ret < 0)
++			pr_warn("native ZC_HELLO_ACK route=0x%llx rail=0x%x failed: %d\n",
++				info.route, remote.rail_id, ret);
++
++		tb_xdomain_put(xd);
++		tbv_native_control_kick_matching_rail(state, source_xd, &info,
++						      remote.rail_id);
++		return 1;
++	}
++
+ 	if (info.op == TBV_NATIVE_WIRE_OP_READY) {
+ 		memset(&local, 0, sizeof(local));
+ 		ret = tbv_native_control_snapshot(state, source_xd, &info,
+@@ -612,6 +728,80 @@
+ 	return ret;
+ }
+ 
++/*
++ * One zc negotiation round: enable our zc tunnel if we already have the
++ * peer's parameters, then trade ZC_HELLOs. Convergence: each side retries
++ * until its own tunnel is enabled AND the peer has advertised
++ * TBV_NATIVE_WIRE_CAP_ZC_ENABLED (in a request we handled or an ack we got).
++ */
++static int tbv_native_control_zc_exchange_once(struct tbv_state *state,
++					       struct tbv_peer *peer,
++					       struct tbv_rail *rail)
++{
++	struct tbv_native_wire_hello local;
++	struct tbv_native_wire_hello remote;
++	u8 response[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
++	u8 request[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
++	struct tbv_native_wire_info info;
++	int ret;
++
++	mutex_lock(&peer->control_lock);
++
++	if (rail->zc_negotiated &&
++	    rail->zc_path.state == TBV_PATH_RING_STARTED &&
++	    rail->zc_remote_transmit_path >= 0) {
++		ret = tbv_path_enable_tunnel(&rail->zc_path, peer->xd,
++					     rail->zc_remote_transmit_path);
++		if (ret) {
++			mutex_unlock(&peer->control_lock);
++			return ret;
++		}
++		pr_info("enabled zc tunnel route=0x%llx rail=0x%x out_hop=%d remote_out_hop=%d tx_hop=%d rx_hop=%d\n",
++			rail->key.route, rail->rail_id,
++			rail->zc_path.local_transmit_path,
++			rail->zc_remote_transmit_path,
++			rail->zc_path.tx_ring->hop,
++			rail->zc_path.rx_ring->hop);
++	}
++
++	tbv_native_control_fill_zc_hello(rail, &local);
++	ret = tbv_native_wire_build_hello(request, sizeof(request), &local,
++					  TBV_NATIVE_WIRE_OP_ZC_HELLO, 0,
++					  rail->rail_id, local.route,
++					  tbv_native_control_sequence(rail));
++	if (ret < 0)
++		goto out_unlock;
++
++	memset(response, 0, sizeof(response));
++	ret = tb_xdomain_request(peer->xd, request, sizeof(request),
++				 TB_CFG_PKG_XDOMAIN_REQ, response,
++				 sizeof(response),
++				 TB_CFG_PKG_XDOMAIN_RESP,
++				 TBV_NATIVE_HELLO_TIMEOUT_MS);
++	if (ret)
++		goto out_unlock;
++
++	ret = tbv_native_wire_parse_hello(response, sizeof(response), &remote,
++					  &info);
++	if (ret)
++		goto out_unlock;
++	if (info.op != TBV_NATIVE_WIRE_OP_ZC_HELLO_ACK) {
++		ret = -EPROTO;
++		goto out_unlock;
++	}
++	ret = tbv_native_control_apply_zc_remote(state, peer->xd, &info,
++						 &remote, NULL, NULL);
++out_unlock:
++	mutex_unlock(&peer->control_lock);
++	return ret;
++}
++
++static bool tbv_native_control_zc_active(const struct tbv_rail *rail)
++{
++	return rail->zc_path.state == TBV_PATH_TUNNEL_ENABLED &&
++	       rail->zc_remote_enabled;
++}
++
+ static int tbv_native_control_enable_tunnel_once(struct tbv_peer *peer,
+ 						 struct tbv_rail *rail)
+ {
+@@ -777,6 +967,44 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Zero-copy payload path bring-up: strictly after the main data path
++	 * is fully ready (it is only an optimization — until active, raw
++	 * streams keep flowing on the main path).
++	 */
++	if (state->enable_tunnels && tbv_rail_data_ready(rail) &&
++	    rail->zc_rings_ready && tbv_path_zc_supported() &&
++	    (rail->remote_caps & TBV_NATIVE_WIRE_CAP_ZC_PATH)) {
++		if (!tbv_native_control_zc_active(rail) &&
++		    rail->zc_attempts < TBV_NATIVE_ZC_RETRIES) {
++			attempt = ++rail->zc_attempts;
++			ret = tbv_native_control_zc_exchange_once(state, peer,
++								  rail);
++			if (!tbv_native_control_zc_active(rail)) {
++				if (attempt < TBV_NATIVE_ZC_RETRIES)
++					retry = true;
++				else
++					pr_warn("zc path negotiation gave up route=0x%llx rail=0x%x last_err=%d; raw streams stay on the main path\n",
++						rail->key.route, rail->rail_id,
++						ret);
++			}
++		}
++		/*
++		 * Activation can also complete in the packet handler (the
++		 * peer's ZC_HELLO delivered its enabled bit) — arm the
++		 * sender-side credit gate exactly once either way.
++		 */
++		if (tbv_native_control_zc_active(rail) &&
++		    !READ_ONCE(rail->zc_path.tx_remote_data_credit_max)) {
++			tbv_path_set_zc_remote_capacity(
++				&rail->zc_path, rail->zc_remote_rx_ring_size);
++			pr_info("zc path ACTIVE route=0x%llx rail=0x%x remote_credits=%u attempts=%u\n",
++				rail->key.route, rail->rail_id,
++				rail->zc_remote_rx_ring_size,
++				rail->zc_attempts);
++		}
++	}
++
+ out:
+ 	if (retry) {
+ 		mutex_lock(&state->lock);
+--- a/kernel/path.c
++++ b/kernel/path.c
+@@ -25,6 +25,20 @@
+ #define TBV_TX_POLL_DELAY_MS 1
+ #define TBV_RX_SUPP_POLL_DELAY_MS 1
+ #define TBV_RX_SUPP_POLL_WINDOW_MS 16
++
++/*
++ * Service native RX rings in poll mode: the ring IRQ only schedules a work
++ * item, and that single work item is the only RX dequeuer (drain, re-enable
++ * IRQ, drain again to close the unmask race). This keeps frame ordering
++ * single-sourced while making a stranded frame impossible — in callback mode
++ * a missed/coalesce-raced ring IRQ left RX frames sitting until the sender's
++ * IB retransmit timeout (~67ms+) fired, seen as rare 40-120ms latency spikes.
++ * Set rx_poll_mode=0 to revert to callback-mode servicing.
++ */
++static bool rx_poll_mode = true;
++module_param(rx_poll_mode, bool, 0444);
++MODULE_PARM_DESC(rx_poll_mode,
++		 "Service native RX rings via a single poll-mode worker (default 1)");
+ /*
+  * Raw-stream zcopy serializes each DMA path, so several QPs sharing a rail can
+  * briefly queue a full TX-depth worth of packetized WRs behind one active
+@@ -97,6 +111,34 @@
+ 	bool tx;
+ };
+ 
++/*
++ * Zero-copy RX stream: one raw WRITE stream whose payload frames arrive on
++ * the rail's dedicated zc path and land directly in posted destination-MR
++ * pages (or bounce frames when a chunk can't be placed). Chunk shape is
++ * [first_chunk, 4K, 4K, ..., tail]; descriptors are posted strictly in
++ * stream-FIFO order so ring order == stream order.
++ */
++struct tbv_zc_rx_stream {
++	struct list_head node;
++	struct tbv_native_data_header hdr;
++	void *mr_handle;
++	u32 total;
++	u32 first_chunk;
++	u32 posted;
++	u32 done;
++	u32 outstanding;
++	bool error;
++};
++
++struct tbv_zc_rx_desc {
++	struct ring_frame frame;
++	struct list_head node;
++	struct tbv_path *path;
++	struct tbv_zc_rx_stream *stream;
++	struct tbv_data_frame *bounce;
++	u32 expect_len;
++};
++
+ struct tbv_tx_packet {
+ 	struct list_head node;
+ 	struct tbv_path *path;
+@@ -120,6 +162,23 @@
+ 	bool raw_stream_start;
+ 	bool raw_stream_end;
+ 	bool raw_stream_counted;
++	/*
++	 * Split-pair header: after this packet drains, ONLY the same owner's
++	 * zcopy payload may drain next (any queue). No completion tracking —
++	 * the latch releases the moment the payload is on the ring.
++	 */
++	bool raw_pair_start;
++	/* Payload frames this pair header covers (latch count). */
++	u16 raw_pair_frames;
++	/*
++	 * Copied-path frame fill: when fill != NULL this packet carries no
++	 * ->buf; the [header|payload] body is produced straight into the
++	 * pre-mapped staging frame at TX time (see the drain loop below).
++	 */
++	tbv_path_tx_frame_fill_fn fill;
++	void *fill_ctx;
++	u32 fill_offset;
++	bool fill_last;
+ 	u8 control_buf[TBV_CONTROL_FRAME_SIZE];
+ };
+ 
+@@ -258,6 +317,7 @@
+ static void tbv_path_schedule_tx(struct tbv_path *path);
+ static void tbv_path_tx_poll_work(struct work_struct *work);
+ static void tbv_path_rx_supp_poll_work(struct work_struct *work);
++static void tbv_path_rx_ring_work(struct work_struct *work);
+ 
+ static bool tbv_path_progress_poll_enabled(const struct tbv_path *path)
+ {
+@@ -392,13 +452,14 @@
+ 	tbv_path_schedule_tx(path);
+ }
+ 
+-static int tbv_path_send_rx_credit(struct tbv_path *path, u32 credits)
++static int tbv_path_send_credit_op(struct tbv_path *path, u8 opcode,
++				   u32 credits)
+ {
+ 	struct tbv_native_data_header hdr = {};
+ 	u8 frame[TBV_NATIVE_DATA_HDR_SIZE];
+ 	int len;
+ 
+-	hdr.opcode = TBV_NATIVE_DATA_OP_PATH_CREDIT;
++	hdr.opcode = opcode;
+ 	hdr.imm_data = credits;
+ 
+ 	len = tbv_native_data_build_header(frame, sizeof(frame), &hdr);
+@@ -408,6 +469,54 @@
+ 	return tbv_path_send(path, frame, len, TBV_PATH_SEND_CONTROL, NULL, NULL);
+ }
+ 
++static int tbv_path_send_rx_credit(struct tbv_path *path, u32 credits)
++{
++	return tbv_path_send_credit_op(path, TBV_NATIVE_DATA_OP_PATH_CREDIT,
++				       credits);
++}
++
++/*
++ * Grant the peer TX credits for OUR zc path RX ring. Grants ride the MAIN
++ * path (the zc path itself carries payload frames only). Accumulates on
++ * transient send failure and retries with the next grant.
++ */
++static void tbv_path_zc_grant_credits(struct tbv_path *zc_path, u32 credits)
++{
++	struct tbv_path *main_path;
++	unsigned long flags;
++	u32 send;
++	int ret;
++
++	if (!zc_path->rail)
++		return;
++	main_path = &zc_path->rail->path;
++
++	spin_lock_irqsave(&zc_path->zc_lock, flags);
++	if (credits > U32_MAX - zc_path->zc_credit_pending)
++		zc_path->zc_credit_pending = U32_MAX;
++	else
++		zc_path->zc_credit_pending += credits;
++	send = zc_path->zc_credit_pending;
++	spin_unlock_irqrestore(&zc_path->zc_lock, flags);
++
++	if (!send)
++		return;
++
++	ret = tbv_path_send_credit_op(main_path,
++				      TBV_NATIVE_DATA_OP_ZC_PATH_CREDIT, send);
++	if (ret) {
++		atomic64_inc(&zc_path->zc_credit_send_error);
++		return;
++	}
++
++	spin_lock_irqsave(&zc_path->zc_lock, flags);
++	if (zc_path->zc_credit_pending >= send)
++		zc_path->zc_credit_pending -= send;
++	else
++		zc_path->zc_credit_pending = 0;
++	spin_unlock_irqrestore(&zc_path->zc_lock, flags);
++}
++
+ static void tbv_path_return_rx_data_credit(struct tbv_path *path, u32 credits)
+ {
+ 	struct tbv_state *state;
+@@ -478,7 +587,8 @@
+ static bool
+ tbv_native_data_valid_path_credit(const struct tbv_native_data_header *hdr)
+ {
+-	return hdr->opcode == TBV_NATIVE_DATA_OP_PATH_CREDIT &&
++	return (hdr->opcode == TBV_NATIVE_DATA_OP_PATH_CREDIT ||
++		hdr->opcode == TBV_NATIVE_DATA_OP_ZC_PATH_CREDIT) &&
+ 	       hdr->imm_data &&
+ 	       !hdr->flags &&
+ 	       !hdr->dest_qp &&
+@@ -492,11 +602,37 @@
+ static void tbv_path_count_raw_stream_locked(struct tbv_path *path,
+ 					     struct tbv_tx_packet *packet)
+ {
++	if (packet->raw_pair_start) {
++		path->tx_raw_pair_pending = true;
++		path->tx_raw_pair_owner = packet->owner_ctx;
++		path->tx_raw_pair_remaining = packet->raw_pair_frames ?: 1;
++	} else if (path->tx_raw_pair_pending &&
++		   packet->owner_ctx == path->tx_raw_pair_owner) {
++		if (path->tx_raw_pair_remaining)
++			path->tx_raw_pair_remaining--;
++		if (!path->tx_raw_pair_remaining) {
++			path->tx_raw_pair_pending = false;
++			path->tx_raw_pair_owner = NULL;
++		}
++	}
+ 	if (packet->raw_stream_start) {
+-		path->tx_raw_stream_active = true;
+-		path->tx_raw_stream_owner = packet->owner_ctx;
+-		path->tx_raw_stream_inflight = 0;
+-		path->tx_raw_stream_end_seen = false;
++		/*
++		 * A same-owner start while the gate is already held is a
++		 * pipelined next [header, payload] pair: keep the running
++		 * in-flight accounting instead of resetting it, so multiple
++		 * pairs of one split write stream the ring back-to-back.
++		 */
++		if (!path->tx_raw_stream_active ||
++		    path->tx_raw_stream_owner != packet->owner_ctx) {
++			path->tx_raw_stream_active = true;
++			path->tx_raw_stream_owner = packet->owner_ctx;
++			path->tx_raw_stream_inflight = 0;
++			path->tx_raw_stream_end_seen = false;
++		}
++		path->tx_raw_stream_mid_pair = true;
++	} else if (path->tx_raw_stream_active &&
++		   packet->owner_ctx == path->tx_raw_stream_owner) {
++		path->tx_raw_stream_mid_pair = false;
+ 	}
+ 	if (path->tx_raw_stream_active &&
+ 	    packet->owner_ctx == path->tx_raw_stream_owner) {
+@@ -519,8 +655,14 @@
+ 			path->tx_raw_stream_end_seen = true;
+ 		if (path->tx_raw_stream_inflight)
+ 			path->tx_raw_stream_inflight--;
++		/*
++		 * Never release mid-pair: a drained header whose payload has
++		 * not yet drained must keep the gate even if every posted
++		 * frame has already completed.
++		 */
+ 		if (path->tx_raw_stream_end_seen &&
+-		    !path->tx_raw_stream_inflight) {
++		    !path->tx_raw_stream_inflight &&
++		    !path->tx_raw_stream_mid_pair) {
+ 			path->tx_raw_stream_active = false;
+ 			path->tx_raw_stream_owner = NULL;
+ 			path->tx_raw_stream_end_seen = false;
+@@ -532,6 +674,7 @@
+ 		path->tx_raw_stream_owner = NULL;
+ 		path->tx_raw_stream_end_seen = false;
+ 		path->tx_raw_stream_inflight = 0;
++		path->tx_raw_stream_mid_pair = false;
+ 	}
+ 	spin_unlock_irqrestore(&path->tx_lock, flags);
+ }
+@@ -610,9 +753,14 @@
+ 	INIT_LIST_HEAD(&path->tx_control_queue);
+ 	INIT_LIST_HEAD(&path->tx_data_queue);
+ 	INIT_LIST_HEAD(&path->tx_zcopy_inflight);
++	spin_lock_init(&path->zc_lock);
++	INIT_LIST_HEAD(&path->zc_streams);
++	INIT_LIST_HEAD(&path->zc_free_descs);
++	INIT_LIST_HEAD(&path->zc_free_bounce);
+ 	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
+ 	INIT_DELAYED_WORK(&path->rx_supp_poll_work,
+ 			  tbv_path_rx_supp_poll_work);
++	INIT_WORK(&path->rx_ring_work, tbv_path_rx_ring_work);
+ 	atomic_set(&path->tx_inflight, 0);
+ 	path->local_transmit_path = -1;
+ 	path->local_tx_hop = -1;
+@@ -624,6 +772,8 @@
+ {
+ 	path->tx_ring = NULL;
+ 	path->rx_ring = NULL;
++	/* Option A: drop any stashed split-payload header before the wipe. */
++	kfree(path->rx_split_hdr);
+ 	memset(path, 0, sizeof(*path));
+ 	path->state = TBV_PATH_STOPPED;
+ 	spin_lock_init(&path->tx_lock);
+@@ -633,9 +783,14 @@
+ 	INIT_LIST_HEAD(&path->tx_control_queue);
+ 	INIT_LIST_HEAD(&path->tx_data_queue);
+ 	INIT_LIST_HEAD(&path->tx_zcopy_inflight);
++	spin_lock_init(&path->zc_lock);
++	INIT_LIST_HEAD(&path->zc_streams);
++	INIT_LIST_HEAD(&path->zc_free_descs);
++	INIT_LIST_HEAD(&path->zc_free_bounce);
+ 	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
+ 	INIT_DELAYED_WORK(&path->rx_supp_poll_work,
+ 			  tbv_path_rx_supp_poll_work);
++	INIT_WORK(&path->rx_ring_work, tbv_path_rx_ring_work);
+ 	atomic_set(&path->tx_inflight, 0);
+ 	path->local_transmit_path = -1;
+ 	path->local_tx_hop = -1;
+@@ -643,6 +798,41 @@
+ 	path->remote_transmit_path = -1;
+ }
+ 
++bool tbv_path_zc_supported(void)
++{
++	/*
++	 * The zc RX engine delivers into QP state under a mutex, so it needs
++	 * the poll-mode (process context) ring servicing.
++	 */
++	return READ_ONCE(rx_poll_mode);
++}
++
++bool tbv_rail_zc_tx_ready(struct tbv_rail *rail)
++{
++	return rail && READ_ONCE(rail->zc_remote_enabled) &&
++	       rail->zc_path.state == TBV_PATH_TUNNEL_ENABLED &&
++	       READ_ONCE(rail->zc_path.tx_remote_data_credit_max);
++}
++
++/*
++ * Arm the sender-side credit gate for the zc path: the peer's zc RX ring
++ * capacity is the ceiling, and the balance starts at ZERO — payload frames
++ * only flow as the peer grants credits for descriptors it actually posted.
++ */
++void tbv_path_set_zc_remote_capacity(struct tbv_path *path, u32 rx_ring_size)
++{
++	unsigned long flags;
++
++	if (!path || !rx_ring_size)
++		return;
++
++	spin_lock_irqsave(&path->tx_lock, flags);
++	path->tx_remote_data_credit_max = rx_ring_size;
++	path->tx_remote_data_credits = 0;
++	path->rx_data_credit_pending = 0;
++	spin_unlock_irqrestore(&path->tx_lock, flags);
++}
++
+ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
+ 				 bool canceled)
+ {
+@@ -750,6 +940,57 @@
+ 			msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
+ }
+ 
++/*
++ * Poll-mode RX servicing. The ring IRQ (masked by the NHI core before
++ * start_poll runs) only schedules this work; this work item is the sole RX
++ * dequeuer, so frame ordering stays single-sourced. After draining we
++ * re-enable the interrupt and drain once more to close the race where a
++ * frame completes between the last poll and the unmask — the failure that
++ * used to strand frames until the peer's IB retransmit timeout. Workqueue
++ * non-reentrancy serializes any rerun queued by a new IRQ meanwhile.
++ */
++static void tbv_path_rx_ring_work(struct work_struct *work)
++{
++	struct tbv_path *path = container_of(work, struct tbv_path,
++					     rx_ring_work);
++	struct tb_ring *ring = READ_ONCE(path->rx_ring);
++	struct ring_frame *frame;
++	u64 completed = 0;
++	u64 race_frames = 0;
++
++	if (!ring)
++		return;
++
++	atomic64_inc(&path->rx_ring_work_calls);
++	while ((frame = tb_ring_poll(ring))) {
++		if (frame->callback)
++			frame->callback(ring, frame, false);
++		completed++;
++	}
++	tb_ring_poll_complete(ring);
++	while ((frame = tb_ring_poll(ring))) {
++		if (frame->callback)
++			frame->callback(ring, frame, false);
++		race_frames++;
++	}
++	if (completed)
++		atomic64_add(completed, &path->rx_ring_work_completed);
++	if (race_frames)
++		atomic64_add(race_frames, &path->rx_ring_work_race_frames);
++}
++
++/* Runs in hard-IRQ context from the NHI MSI-X handler. */
++static void tbv_path_rx_ring_ready(void *data)
++{
++	struct tbv_path *path = data;
++	struct tbv_state *state = tbv_path_state(path);
++
++	if (state && state->workqueue)
++		queue_work(state->workqueue, &path->rx_ring_work);
++	else
++		schedule_work(&path->rx_ring_work);
++}
++
+ static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
+ 
+ static void tbv_path_rx_start_raw(struct tbv_path *path,
+@@ -813,6 +1054,255 @@
+ 		tbv_ibdev_rx_native_frame(state, path, &hdr, payload);
+ }
+ 
++/* ------------------------- zc RX engine ------------------------- */
++
++static void tbv_path_zc_rx_complete(struct tb_ring *ring,
++				    struct ring_frame *frame, bool canceled);
++
++static u32 tbv_zc_stream_chunk_len(const struct tbv_zc_rx_stream *stream,
++				   u32 off)
++{
++	u32 remaining = stream->total - off;
++	u32 chunk = off ? TBV_DATA_FRAME_SIZE : stream->first_chunk;
++
++	return min(chunk, remaining);
++}
++
++/*
++ * Post RX descriptors for pending streams, strictly stream-FIFO so the
++ * ring's frame order equals the sender's stream order. Every posted
++ * descriptor earns the peer one TX credit (granted on the main path);
++ * running out of descs/bounce frames just pauses posting — the sender
++ * stalls on credits, never overruns.
++ */
++static void tbv_path_zc_post_more(struct tbv_path *path)
++{
++	struct tbv_zc_rx_stream *stream;
++	unsigned long flags;
++	u32 granted = 0;
++
++	if (path->state != TBV_PATH_RING_STARTED &&
++	    path->state != TBV_PATH_TUNNEL_ENABLED)
++		return;
++
++	spin_lock_irqsave(&path->zc_lock, flags);
++	list_for_each_entry(stream, &path->zc_streams, node) {
++		while (stream->posted < stream->total) {
++			u32 len = tbv_zc_stream_chunk_len(stream,
++							  stream->posted);
++			struct tbv_zc_rx_desc *desc;
++			struct tbv_data_frame *bounce = NULL;
++			dma_addr_t dma = 0;
++			bool placed = false;
++
++			if (list_empty(&path->zc_free_descs))
++				goto out;
++			desc = list_first_entry(&path->zc_free_descs,
++						struct tbv_zc_rx_desc, node);
++
++			if (stream->mr_handle && !stream->error)
++				placed = !tbv_ibdev_zc_chunk_dma(
++					stream->mr_handle,
++					stream->hdr.remote_addr +
++					stream->posted, len, &dma);
++			if (!placed) {
++				if (list_empty(&path->zc_free_bounce))
++					goto out;
++				bounce = list_first_entry(
++					&path->zc_free_bounce,
++					struct tbv_data_frame, free_node);
++				dma_sync_single_for_device(
++					tb_ring_dma_device(path->rx_ring),
++					bounce->dma, TBV_DATA_FRAME_SIZE,
++					DMA_FROM_DEVICE);
++			}
++
++			desc->stream = stream;
++			desc->bounce = bounce;
++			desc->expect_len = len;
++			desc->frame.buffer_phy = bounce ? bounce->dma : dma;
++			desc->frame.callback = tbv_path_zc_rx_complete;
++			desc->frame.size = 0;
++			desc->frame.flags = 0;
++			desc->frame.sof = 0;
++			desc->frame.eof = 0;
++			if (tb_ring_rx(path->rx_ring, &desc->frame))
++				goto out;
++			list_del_init(&desc->node);
++			if (bounce)
++				list_del_init(&bounce->free_node);
++			stream->posted += len;
++			stream->outstanding++;
++			granted++;
++		}
++	}
++out:
++	spin_unlock_irqrestore(&path->zc_lock, flags);
++	if (granted)
++		tbv_path_zc_grant_credits(path, granted);
++}
++
++static void tbv_path_zc_rx_complete(struct tb_ring *ring,
++				    struct ring_frame *frame, bool canceled)
++{
++	struct tbv_zc_rx_desc *desc = container_of(frame,
++						   struct tbv_zc_rx_desc,
++						   frame);
++	struct tbv_path *path = desc->path;
++	struct tbv_zc_rx_stream *stream = desc->stream;
++	struct tbv_state *state = tbv_path_state(path);
++	struct tbv_data_frame *bounce = desc->bounce;
++	struct tbv_native_data_header hdr;
++	u32 len = tbv_frame_len(frame);
++	LIST_HEAD(retired);
++	unsigned long flags;
++	bool deliver = false;
++
++	if (!canceled && bounce)
++		dma_sync_single_for_cpu(tb_ring_dma_device(ring), bounce->dma,
++					TBV_DATA_FRAME_SIZE, DMA_FROM_DEVICE);
++
++	spin_lock_irqsave(&path->zc_lock, flags);
++	if (stream) {
++		if (stream->outstanding)
++			stream->outstanding--;
++		if (canceled) {
++			stream->error = true;
++		} else if (!stream->error) {
++			struct tbv_native_data_header stream_hdr = stream->hdr;
++
++			stream_hdr.length = stream->total;
++			if (len != desc->expect_len ||
++			    tbv_native_data_raw_payload_header(
++				    &stream_hdr, stream->done,
++				    stream->total - stream->done, len, &hdr)) {
++				stream->error = true;
++				atomic64_inc(&path->zc_rx_bad_frame);
++			} else {
++				stream->done += len;
++				deliver = true;
++			}
++		}
++	}
++	spin_unlock_irqrestore(&path->zc_lock, flags);
++
++	if (deliver && state && path->rail) {
++		if (bounce)
++			atomic64_inc(&path->zc_rx_bounced);
++		else
++			atomic64_inc(&path->zc_rx_placed);
++		/*
++		 * Deliver against the MAIN path: acks and any responses must
++		 * never ride the payload-only zc path. payload == NULL means
++		 * "already placed in the destination MR" — the write handler
++		 * only advances its bookkeeping.
++		 */
++		tbv_ibdev_rx_native_frame(state, &path->rail->path, &hdr,
++					  bounce ? bounce->buf : NULL);
++	}
++
++	spin_lock_irqsave(&path->zc_lock, flags);
++	desc->stream = NULL;
++	desc->bounce = NULL;
++	if (bounce)
++		list_add_tail(&bounce->free_node, &path->zc_free_bounce);
++	list_add_tail(&desc->node, &path->zc_free_descs);
++	while (!list_empty(&path->zc_streams)) {
++		struct tbv_zc_rx_stream *head =
++			list_first_entry(&path->zc_streams,
++					 struct tbv_zc_rx_stream, node);
++
++		if (head->posted != head->total || head->outstanding)
++			break;
++		list_move_tail(&head->node, &retired);
++	}
++	spin_unlock_irqrestore(&path->zc_lock, flags);
++
++	while (!list_empty(&retired)) {
++		struct tbv_zc_rx_stream *head =
++			list_first_entry(&retired, struct tbv_zc_rx_stream,
++					 node);
++
++		list_del_init(&head->node);
++		if (head->error)
++			atomic64_inc(&path->zc_rx_stream_errors);
++		tbv_ibdev_zc_stream_end(head->mr_handle);
++		kfree(head);
++	}
++
++	if (!canceled)
++		tbv_path_zc_post_more(path);
++}
++
++void tbv_path_zc_rx_arm(struct tbv_state *state, struct tbv_rail *rail,
++			const struct tbv_native_data_header *hdr)
++{
++	struct tbv_path *path = &rail->zc_path;
++	struct tbv_zc_rx_stream *stream;
++	unsigned long flags;
++
++	if (!path->zc_rx || path->state != TBV_PATH_TUNNEL_ENABLED ||
++	    !hdr->frag_offset || hdr->frag_offset > TBV_DATA_FRAME_SIZE ||
++	    hdr->frag_offset > hdr->length) {
++		if (state)
++			atomic64_inc(&state->data_rx_bad_frame);
++		return;
++	}
++
++	stream = kzalloc(sizeof(*stream), GFP_ATOMIC);
++	if (!stream) {
++		if (state)
++			atomic64_inc(&state->data_rx_bad_frame);
++		return;
++	}
++	INIT_LIST_HEAD(&stream->node);
++	stream->hdr = *hdr;
++	stream->total = hdr->length;
++	stream->first_chunk = hdr->frag_offset;
++	stream->mr_handle = tbv_ibdev_zc_stream_begin(state, hdr);
++
++	spin_lock_irqsave(&path->zc_lock, flags);
++	list_add_tail(&stream->node, &path->zc_streams);
++	spin_unlock_irqrestore(&path->zc_lock, flags);
++	atomic64_inc(&path->zc_rx_streams);
++	tbv_path_zc_post_more(path);
++}
++
++void tbv_path_zc_flush(struct tbv_path *path)
++{
++	LIST_HEAD(flush);
++	struct tbv_zc_rx_stream *stream;
++	struct tbv_zc_rx_stream *tmp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&path->zc_lock, flags);
++	list_for_each_entry_safe(stream, tmp, &path->zc_streams, node) {
++		/*
++		 * Streams with outstanding descriptors would be use-after-free
++		 * targets for late canceled completions; by the time flush
++		 * runs (rings stopped and freed) there should be none — leak
++		 * loudly rather than corrupt if that assumption ever breaks.
++		 */
++		if (stream->outstanding) {
++			pr_warn("zc flush leaking stream with %u outstanding descs\n",
++				stream->outstanding);
++			list_del_init(&stream->node);
++			continue;
++		}
++		list_move_tail(&stream->node, &flush);
++	}
++	path->zc_credit_pending = 0;
++	spin_unlock_irqrestore(&path->zc_lock, flags);
++
++	while (!list_empty(&flush)) {
++		stream = list_first_entry(&flush, struct tbv_zc_rx_stream,
++					  node);
++		list_del_init(&stream->node);
++		tbv_ibdev_zc_stream_end(stream->mr_handle);
++		kfree(stream);
++	}
++}
++
+ static void tbv_path_zcopy_tx_complete(struct tb_ring *ring,
+ 				       struct ring_frame *frame,
+ 				       bool canceled)
+@@ -857,6 +1347,7 @@
+ 	u32 return_rx_credits = 0;
+ 	u32 add_remote_credits = 0;
+ 	bool was_raw_payload;
++	bool was_split_payload;
+ 
+ 	if (canceled) {
+ 		if (state)
+@@ -871,6 +1362,7 @@
+ 	dma_sync_single_for_cpu(tb_ring_dma_device(ring), f->dma,
+ 				TBV_DATA_FRAME_SIZE, DMA_FROM_DEVICE);
+ 	was_raw_payload = path->rx_raw_pending;
++	was_split_payload = path->rx_split_pending;
+ 	if (len <= TBV_DATA_FRAME_SIZE && state) {
+ 		struct tbv_native_data_header hdr;
+ 		int ret;
+@@ -882,6 +1374,40 @@
+ 		} else if (was_raw_payload) {
+ 			return_rx_credits = 1;
+ 			tbv_path_rx_raw_payload(path, state, f->buf, len);
++		} else if (was_split_payload) {
++			/*
++			 * Option A: this frame is the payload that follows a
++			 * previously stashed F_SPLIT_PAYLOAD header. Pair them
++			 * and dispatch; the header frame already returned its
++			 * own RX credit, and this payload frame returns one too.
++			 */
++			struct tbv_native_data_header sub;
++			u32 take = min_t(u32, len,
++					 path->rx_split_remaining);
++
++			return_rx_credits = 1;
++			/*
++			 * Multi-frame chunk: dispatch this frame as its own
++			 * sub-fragment of the stashed header. Same psn (the
++			 * protocol is per-WR), advanced frag_offset; only the
++			 * chunk's final frame keeps LAST/SOLICITED so the
++			 * write completes exactly once.
++			 */
++			sub = *path->rx_split_hdr;
++			sub.frag_offset += path->rx_split_consumed;
++			sub.length = take;
++			if (take < path->rx_split_remaining)
++				sub.flags &= ~(TBV_NATIVE_DATA_F_LAST |
++					       TBV_NATIVE_DATA_F_SOLICITED);
++			tbv_ibdev_rx_split_payload(state, path, &sub,
++						   f->buf, take);
++			path->rx_split_consumed += take;
++			path->rx_split_remaining -= take;
++			if (!path->rx_split_remaining) {
++				kfree(path->rx_split_hdr);
++				path->rx_split_hdr = NULL;
++				path->rx_split_pending = false;
++			}
+ 		} else {
+ 				ret = tbv_native_data_parse_header(f->buf, len, &hdr);
+ 				if (!ret && hdr.opcode == TBV_NATIVE_DATA_OP_PATH_CREDIT) {
+@@ -908,17 +1434,60 @@
+ 								    0);
+ 					}
+ 				} else if (!ret &&
++					   hdr.opcode == TBV_NATIVE_DATA_OP_ZC_PATH_CREDIT) {
++					if (tbv_native_data_valid_path_credit(&hdr) &&
++					    path->rail) {
++						tbv_path_add_remote_rx_credits(
++							&path->rail->zc_path,
++							hdr.imm_data);
++					} else {
++						atomic64_inc(&state->data_rx_bad_header);
++						atomic64_inc(&state->data_rx_bad_header_path_credit);
++					}
++				} else if (!ret &&
+ 					   (hdr.flags & TBV_NATIVE_DATA_F_RAW_STREAM)) {
+ 				if (len != TBV_NATIVE_DATA_HDR_SIZE ||
+ 				    !hdr.length ||
+ 				    (hdr.flags & ~(TBV_NATIVE_DATA_F_LAST |
+ 						   TBV_NATIVE_DATA_F_SOLICITED |
+-						   TBV_NATIVE_DATA_F_RAW_STREAM))) {
++						   TBV_NATIVE_DATA_F_RAW_STREAM |
++						   TBV_NATIVE_DATA_F_ZC_PATH))) {
+ 					atomic64_inc(&state->data_rx_bad_frame);
++				} else if (hdr.flags & TBV_NATIVE_DATA_F_ZC_PATH) {
++					return_rx_credits = 1;
++					if (path->rail)
++						tbv_path_zc_rx_arm(state,
++								   path->rail,
++								   &hdr);
+ 				} else {
+ 					return_rx_credits = 1;
+ 					tbv_path_rx_start_raw(path, &hdr);
+ 				}
++			} else if (!ret &&
++				   (hdr.flags & TBV_NATIVE_DATA_F_SPLIT_PAYLOAD)) {
++				/*
++				 * Option A: header-only frame; its payload is the
++				 * next frame on this path. Stash the header and
++				 * arm the pairing. Return this header's RX credit
++				 * now (the payload returns its own on arrival).
++				 */
++				struct tbv_native_data_header *saved;
++
++				if (len != TBV_NATIVE_DATA_HDR_SIZE ||
++				    path->rx_split_pending || !hdr.length ||
++				    hdr.length > TBV_NATIVE_DATA_SPLIT_MAX_FRAMES *
++						 TBV_NATIVE_DATA_FRAME_SIZE) {
++					atomic64_inc(&state->data_rx_bad_frame);
++				} else if (!(saved = kmemdup(&hdr, sizeof(hdr),
++							     GFP_ATOMIC))) {
++					atomic64_inc(&state->data_rx_bad_frame);
++				} else {
++					return_rx_credits = 1;
++					path->rx_split_hdr = saved;
++					path->rx_split_pending = true;
++					path->rx_split_remaining = hdr.length;
++					path->rx_split_consumed = 0;
++				}
+ 			} else {
+ 				if (!ret &&
+ 				    tbv_native_data_consumes_rx_credit(hdr.opcode))
+@@ -968,7 +1537,7 @@
+ 		return -EPROBE_DEFER;
+ 	}
+ 
+-	frames = kcalloc(count, sizeof(*frames), GFP_KERNEL);
++	frames = kvcalloc(count, sizeof(*frames), GFP_KERNEL);
+ 	if (!frames)
+ 		return -ENOMEM;
+ 
+@@ -1010,7 +1579,7 @@
+ 			kfree(f->buf);
+ 		}
+ 	}
+-	kfree(frames);
++	kvfree(frames);
+ 	return ret;
+ }
+ 
+@@ -1050,7 +1619,7 @@
+ 		path->rx_frames = NULL;
+ 		path->rx_frame_count = 0;
+ 	}
+-	kfree(frames);
++	kvfree(frames);
+ }
+ 
+ static int tbv_path_alloc_control_packets(struct tbv_path *path)
+@@ -1059,7 +1628,7 @@
+ 	u32 count = tbv_path_control_packet_count(path);
+ 	u32 i;
+ 
+-	packets = kcalloc(count, sizeof(*packets), GFP_KERNEL);
++	packets = kvcalloc(count, sizeof(*packets), GFP_KERNEL);
+ 	if (!packets)
+ 		return -ENOMEM;
+ 
+@@ -1083,7 +1652,7 @@
+ 
+ static void tbv_path_free_control_packets(struct tbv_path *path)
+ {
+-	kfree(path->tx_control_packets);
++	kvfree(path->tx_control_packets);
+ 	path->tx_control_packets = NULL;
+ 	path->tx_control_packet_count = 0;
+ 	path->tx_control_queued = 0;
+@@ -1103,7 +1672,7 @@
+ 	    path->rail->peer->backend != TBV_BACKEND_APPLE)
+ 		return 0;
+ 
+-	packets = kcalloc(count, sizeof(*packets), GFP_KERNEL);
++	packets = kvcalloc(count, sizeof(*packets), GFP_KERNEL);
+ 	if (!packets)
+ 		return -ENOMEM;
+ 
+@@ -1126,7 +1695,7 @@
+ err:
+ 	while (i-- > 0)
+ 		kfree(packets[i].buf);
+-	kfree(packets);
++	kvfree(packets);
+ 	INIT_LIST_HEAD(&path->tx_data_free);
+ 	return -ENOMEM;
+ }
+@@ -1137,7 +1706,7 @@
+ 
+ 	for (i = 0; i < path->tx_data_packet_count; i++)
+ 		kfree(path->tx_data_packets[i].buf);
+-	kfree(path->tx_data_packets);
++	kvfree(path->tx_data_packets);
+ 	path->tx_data_packets = NULL;
+ 	path->tx_data_packet_count = 0;
+ 	INIT_LIST_HEAD(&path->tx_data_free);
+@@ -1206,6 +1775,8 @@
+ 					 path->cfg.tx_ring_size,
+ 					 path->cfg.tx_flags);
+ 	if (!path->tx_ring) {
++		pr_warn("alloc rings: TX ring alloc failed (hop=%d size=%u)\n",
++			tx_hop, path->cfg.tx_ring_size);
+ 		ret = -ENOMEM;
+ 		goto err_in_hop;
+ 	}
+@@ -1213,6 +1784,8 @@
+ 	transmit_path = tb_xdomain_alloc_out_hopid(xd,
+ 						   requested_transmit_path);
+ 	if (transmit_path < 0) {
++		pr_warn("alloc rings: out hopid alloc failed ret=%d (requested=%d)\n",
++			transmit_path, requested_transmit_path);
+ 		ret = transmit_path;
+ 		goto err_tx_ring;
+ 	}
+@@ -1230,15 +1803,28 @@
+ 	 * frames to the verbs receive queue before earlier frames. Keep RX
+ 	 * completion single-sourced; TX polling is still used for timely send
+ 	 * completions.
++	 *
++	 * For the native path, single-sourcing is instead achieved by
++	 * servicing the ring in poll mode (rx_ring_work is the only
++	 * dequeuer) — see tbv_path_rx_ring_work(). Callback mode could
++	 * strand a frame whose ring IRQ was missed/coalesce-raced until the
++	 * peer's IB retransmit timeout.
+ 	 */
+ 	path->rx_supp_poll_enabled = false;
++	path->rx_poll_mode_active = rx_poll_mode &&
++				    tbv_path_progress_poll_enabled(path);
+ 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
+ 					 path->cfg.rx_ring_size,
+ 					 path->cfg.rx_flags, e2e_tx_hop,
+ 					 path->cfg.sof_mask,
+ 					 path->cfg.eof_mask,
+-					 NULL, NULL);
++					 path->rx_poll_mode_active ?
++						 tbv_path_rx_ring_ready : NULL,
++					 path->rx_poll_mode_active ?
++						 path : NULL);
+ 	if (!path->rx_ring) {
++		pr_warn("alloc rings: RX ring alloc failed (hop=%d size=%u)\n",
++			rx_hop, path->cfg.rx_ring_size);
+ 		ret = -ENOMEM;
+ 		goto err_out_hop;
+ 	}
+@@ -1248,21 +1834,53 @@
+ 	if (ret)
+ 		goto err_rx_ring;
+ 	ret = tbv_path_alloc_frames(path, true);
+-	if (ret)
++	if (ret) {
++		pr_warn("alloc rings: TX frame pool alloc failed ret=%d\n", ret);
+ 		goto err_rx_ring;
++	}
+ 	ret = tbv_path_alloc_frames(path, false);
+-	if (ret)
++	if (ret) {
++		pr_warn("alloc rings: RX frame pool alloc failed ret=%d\n", ret);
+ 		goto err_tx_frames;
++	}
+ 	ret = tbv_path_alloc_control_packets(path);
+-	if (ret)
++	if (ret) {
++		pr_warn("alloc rings: control packet pool alloc failed ret=%d\n",
++			ret);
+ 		goto err_rx_frames;
++	}
+ 	ret = tbv_path_alloc_data_packets(path);
+-	if (ret)
++	if (ret) {
++		pr_warn("alloc rings: data packet pool alloc failed ret=%d\n",
++			ret);
+ 		goto err_control_packets;
++	}
++
++	if (path->zc_rx) {
++		u32 i;
++
++		path->zc_descs = kvcalloc(path->cfg.rx_ring_size,
++					 sizeof(*path->zc_descs), GFP_KERNEL);
++		if (!path->zc_descs) {
++			ret = -ENOMEM;
++			goto err_data_packets;
++		}
++		path->zc_desc_count = path->cfg.rx_ring_size;
++		for (i = 0; i < path->zc_desc_count; i++) {
++			struct tbv_zc_rx_desc *desc = &path->zc_descs[i];
++
++			desc->path = path;
++			INIT_LIST_HEAD(&desc->node);
++			INIT_LIST_HEAD(&desc->frame.list);
++			list_add_tail(&desc->node, &path->zc_free_descs);
++		}
++	}
+ 
+ 	path->state = TBV_PATH_RING_ALLOCATED;
+ 	return 0;
+ 
++err_data_packets:
++	tbv_path_free_data_packets(path);
+ err_control_packets:
+ 	tbv_path_free_control_packets(path);
+ err_rx_frames:
+@@ -1270,6 +1888,7 @@
+ err_tx_frames:
+ 	tbv_path_free_frames(path, true);
+ err_rx_ring:
++	cancel_work_sync(&path->rx_ring_work);
+ 	tb_ring_free(path->rx_ring);
+ 	path->rx_ring = NULL;
+ 	path->local_rx_hop = -1;
+@@ -1300,6 +1919,17 @@
+ 	tb_ring_start(path->rx_ring);
+ 	path->state = TBV_PATH_RING_STARTED;
+ 	for (i = 0; i < path->rx_frame_count; i++) {
++		/*
++		 * zc payload path: the RX ring starts EMPTY. Frames become the
++		 * bounce pool; the zc engine posts descriptors per stream and
++		 * the software credit gate keeps the sender from transmitting
++		 * into an unposted ring.
++		 */
++		if (path->zc_rx) {
++			list_add_tail(&path->rx_frames[i].free_node,
++				      &path->zc_free_bounce);
++			continue;
++		}
+ 		ret = tbv_path_post_rx_frame(&path->rx_frames[i]);
+ 		if (ret) {
+ 			pr_warn("post RX frame %u/%u failed ret=%d\n", i,
+@@ -1695,6 +2325,10 @@
+ 		bool needs_staging;
+ 		bool old_raw_stream_active;
+ 		bool old_raw_stream_end_seen;
++		bool old_raw_stream_mid_pair;
++		bool old_raw_pair_pending;
++		u32 old_raw_pair_remaining;
++		void *old_raw_pair_owner;
+ 		void *old_raw_stream_owner;
+ 		u32 old_raw_stream_inflight;
+ 		bool charged_data_credit;
+@@ -1711,7 +2345,13 @@
+ 			return;
+ 		}
+ 
+-		if (path->tx_raw_stream_active) {
++		if (path->tx_raw_pair_pending) {
++			/*
++			 * A split-pair header is on the ring; admit nothing
++			 * but its own payload so the pair stays adjacent on
++			 * the wire. The payload was enqueued atomically right
++			 * behind its header, so it is the data-queue head.
++			 */
+ 			if (list_empty(&path->tx_data_queue)) {
+ 				path->tx_scheduling = false;
+ 				spin_unlock_irqrestore(&path->tx_lock, flags);
+@@ -1719,14 +2359,48 @@
+ 			}
+ 			packet = list_first_entry(&path->tx_data_queue,
+ 						  struct tbv_tx_packet, node);
+-			if (!packet->zcopy || packet->raw_stream_start ||
+-			    packet->owner_ctx != path->tx_raw_stream_owner) {
++			if (packet->owner_ctx != path->tx_raw_pair_owner ||
++			    !packet->zcopy || packet->raw_pair_start) {
+ 				path->tx_scheduling = false;
+ 				spin_unlock_irqrestore(&path->tx_lock, flags);
+ 				return;
+ 			}
+ 			from_control_queue = false;
+ 			needs_staging = false;
++		} else if (path->tx_raw_stream_active) {
++			bool allowed;
++
++			if (list_empty(&path->tx_data_queue)) {
++				path->tx_scheduling = false;
++				spin_unlock_irqrestore(&path->tx_lock, flags);
++				return;
++			}
++			packet = list_first_entry(&path->tx_data_queue,
++						  struct tbv_tx_packet, node);
++			/*
++			 * While the gate is held, only the owning stream may
++			 * drain. Mid-pair (split header posted, its payload
++			 * not yet) the ONLY admissible frame is that payload;
++			 * between pairs the stream's next header may follow
++			 * back-to-back, pipelining pair after pair without
++			 * waiting for the previous pair's completions.
++			 */
++			allowed = packet->owner_ctx == path->tx_raw_stream_owner;
++			if (allowed) {
++				if (path->tx_raw_stream_mid_pair)
++					allowed = packet->zcopy &&
++						  !packet->raw_stream_start;
++				else
++					allowed = packet->zcopy ||
++						  packet->raw_stream_start;
++			}
++			if (!allowed) {
++				path->tx_scheduling = false;
++				spin_unlock_irqrestore(&path->tx_lock, flags);
++				return;
++			}
++			from_control_queue = false;
++			needs_staging = !packet->zcopy;
+ 		} else if (!list_empty(&path->tx_control_queue)) {
+ 			packet = list_first_entry(&path->tx_control_queue,
+ 						  struct tbv_tx_packet, node);
+@@ -1807,6 +2481,10 @@
+ 		old_raw_stream_owner = path->tx_raw_stream_owner;
+ 		old_raw_stream_end_seen = path->tx_raw_stream_end_seen;
+ 		old_raw_stream_inflight = path->tx_raw_stream_inflight;
++		old_raw_stream_mid_pair = path->tx_raw_stream_mid_pair;
++		old_raw_pair_pending = path->tx_raw_pair_pending;
++		old_raw_pair_owner = path->tx_raw_pair_owner;
++		old_raw_pair_remaining = path->tx_raw_pair_remaining;
+ 		tbv_path_count_raw_stream_locked(path, packet);
+ 
+ 		if (needs_staging) {
+@@ -1857,6 +2535,10 @@
+ 			path->tx_raw_stream_owner = old_raw_stream_owner;
+ 			path->tx_raw_stream_end_seen = old_raw_stream_end_seen;
+ 			path->tx_raw_stream_inflight = old_raw_stream_inflight;
++			path->tx_raw_stream_mid_pair = old_raw_stream_mid_pair;
++			path->tx_raw_pair_pending = old_raw_pair_pending;
++			path->tx_raw_pair_owner = old_raw_pair_owner;
++			path->tx_raw_pair_remaining = old_raw_pair_remaining;
+ 			packet->raw_stream_counted = false;
+ 			if (charged_data_credit) {
+ 				if (path->tx_remote_data_credits <
+@@ -1886,7 +2568,24 @@
+ 			return;
+ 		}
+ 
+-		memcpy(f->buf, packet->buf, packet->len);
++		if (packet->fill) {
++			/*
++			 * Copied-path RC/host-memory frame: build the header
++			 * and gather the MR payload straight into the
++			 * pre-mapped, about-to-be-DMA-synced staging buffer.
++			 * This is the single remaining copy (MR -> ring frame);
++			 * the intermediate kmalloc'd frame and its stage memcpy
++			 * are both gone. Wire bytes are byte-identical to the
++			 * old two-copy path, so the receiver is unchanged.
++			 */
++			ret = packet->fill(packet->fill_ctx, f->buf,
++					   packet->len, packet->fill_offset,
++					   packet->fill_last);
++			if (ret)
++				goto stage_fill_failed;
++		} else {
++			memcpy(f->buf, packet->buf, packet->len);
++		}
+ 		f->packet = packet;
+ 		f->done = packet->done;
+ 		f->done_ctx = packet->done_ctx;
+@@ -1915,6 +2614,7 @@
+ 			continue;
+ 		}
+ 
++stage_fill_failed:
+ 		if (state)
+ 			atomic64_inc(&state->data_tx_errors);
+ 		f->packet = NULL;
+@@ -1927,6 +2627,10 @@
+ 		path->tx_raw_stream_owner = old_raw_stream_owner;
+ 		path->tx_raw_stream_end_seen = old_raw_stream_end_seen;
+ 		path->tx_raw_stream_inflight = old_raw_stream_inflight;
++		path->tx_raw_stream_mid_pair = old_raw_stream_mid_pair;
++		path->tx_raw_pair_pending = old_raw_pair_pending;
++		path->tx_raw_pair_owner = old_raw_pair_owner;
++		path->tx_raw_pair_remaining = old_raw_pair_remaining;
+ 		packet->raw_stream_counted = false;
+ 		if (charged_data_credit) {
+ 			if (path->tx_remote_data_credits <
+@@ -2191,8 +2895,9 @@
+ 					 node);
+ 		list_del_init(&owned->node);
+ 
+-		if (!owned->data || !owned->len ||
+-		    owned->len > TBV_DATA_FRAME_SIZE) {
++		/* Exactly one of data / fill must be set. */
++		if (!owned->len || owned->len > TBV_DATA_FRAME_SIZE ||
++		    (!owned->data == !owned->fill)) {
+ 			kfree(owned->data);
+ 			kfree(owned);
+ 			ret = -EINVAL;
+@@ -2211,6 +2916,10 @@
+ 		owned->data = NULL;
+ 		packet->sof = owned->sof;
+ 		packet->eof = owned->eof;
++		packet->fill = owned->fill;
++		packet->fill_ctx = owned->fill_ctx;
++		packet->fill_offset = owned->fill_offset;
++		packet->fill_last = owned->fill_last;
+ 		list_add_tail(&packet->node, &prepared);
+ 		packet_count++;
+ 		kfree(owned);
+@@ -2268,6 +2977,7 @@
+ }
+ 
+ int tbv_path_send_page_stream(struct tbv_path *path,
++			      struct tbv_path *payload_path,
+ 			      const struct tbv_native_data_header *hdr,
+ 			      u32 total_length, unsigned int send_flags,
+ 			      tbv_path_tx_done_fn meta_done,
+@@ -2276,12 +2986,19 @@
+ {
+ 	struct device *dma_dev;
+ 	LIST_HEAD(packets);
++	LIST_HEAD(payloads);
+ 	u32 prepared = 0;
+ 	u32 packet_count = 0;
++	u32 payload_count = 0;
++	u32 first_len = 0;
++	u32 reserved = 0;
+ 	struct tbv_tx_packet *packet;
++	struct tbv_path *chunk_path;
+ 	u32 max_raw_payload;
+ 	struct tbv_native_data_header stream_hdr;
+ 	u8 *hdr_buf;
++	bool zc;
++	bool start_committed = false;
+ 	int ret;
+ 
+ 	if (!path || !hdr || !next || !total_length) {
+@@ -2300,11 +3017,15 @@
+ 		ret = -ENOTCONN;
+ 		goto err_meta_done;
+ 	}
++	zc = payload_path && payload_path != path &&
++	     payload_path->rail == path->rail;
+ 	if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE ||
+ 	    hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM)
+ 		max_raw_payload = TBV_DATA_FRAME_SIZE;
+ 	else
+ 		max_raw_payload = TBV_NATIVE_DATA_MAX_PAYLOAD;
++	if (zc)
++		max_raw_payload = TBV_DATA_FRAME_SIZE;
+ 
+ 	dma_dev = tb_ring_dma_device(path->tx_ring);
+ 	if (!tbv_dma_device_ready(dma_dev)) {
+@@ -2312,93 +3033,200 @@
+ 		goto err_meta_done;
+ 	}
+ 
+-	hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
+-	if (!hdr_buf) {
+-		ret = -ENOMEM;
+-		goto err_release;
+-	}
+-
+-	stream_hdr = *hdr;
+-	stream_hdr.length = total_length;
+-	stream_hdr.flags |= TBV_NATIVE_DATA_F_LAST |
+-			    TBV_NATIVE_DATA_F_RAW_STREAM;
+-	ret = tbv_native_data_build_header(hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
+-					   &stream_hdr);
+-	if (ret < 0) {
+-		kfree(hdr_buf);
+-		goto err_release;
+-	}
+-
+-	packet = tbv_path_alloc_data_packet_owned(path, hdr_buf,
+-						  TBV_NATIVE_DATA_HDR_SIZE,
+-						  meta_done, meta_done_ctx);
+-	if (!packet) {
+-		kfree(hdr_buf);
+-		ret = -ENOMEM;
+-		goto err_release;
++	if (zc) {
++		/*
++		 * Reserve payload queue room up front (worst case count) so
++		 * the two-path enqueue below cannot fail on queue limits
++		 * after the start header is already committed. If the zc path
++		 * raced down, quietly fall back to the classic single-path
++		 * stream.
++		 */
++		reserved = DIV_ROUND_UP(total_length, TBV_DATA_FRAME_SIZE) + 1;
++		if (tbv_path_reserve_data(payload_path, reserved)) {
++			reserved = 0;
++			zc = false;
++		}
+ 	}
+-	packet->raw_stream_start = true;
+-	list_add_tail(&packet->node, &packets);
+-	packet_count++;
++	chunk_path = zc ? payload_path : path;
+ 
+ 	while (prepared < total_length) {
+ 		tbv_path_tx_done_fn done = NULL;
+ 		struct page *page = NULL;
+ 		void *done_ctx = NULL;
+ 		bool last;
+-		dma_addr_t dma;
++		bool premapped;
++		dma_addr_t dma = 0;
+ 		u32 page_off = 0;
+ 		u32 len = 0;
+ 
+-		ret = next(next_ctx, &page, &page_off, &len, &done, &done_ctx);
++		ret = next(next_ctx, &page, &page_off, &dma, &len, &done,
++			   &done_ctx);
+ 		if (ret)
+ 			goto err_release;
+-		if (!page || !len || len > max_raw_payload ||
++		/* dma-buf MR chunks arrive pre-mapped for the NHI: no page,
++		 * no map/unmap here — the MR's pinned mapping owns it. */
++		premapped = !page && dma;
++		if ((!page && !premapped) || !len || len > max_raw_payload ||
+ 		    len > total_length - prepared ||
+-		    page_off > PAGE_SIZE || len > PAGE_SIZE - page_off) {
++		    (!premapped &&
++		     (page_off > PAGE_SIZE || len > PAGE_SIZE - page_off))) {
+ 			if (done)
+ 				done(done_ctx, -EINVAL);
+ 			ret = -EINVAL;
+ 			goto err_release;
+ 		}
+-
+-		last = prepared + len == total_length;
+-
+-		dma = dma_map_page(dma_dev, page, page_off, len,
+-				   DMA_TO_DEVICE);
+-		if (dma_mapping_error(dma_dev, dma)) {
++		/*
++		 * zc streams must keep the canonical [first, 4K, ..., tail]
++		 * chunk shape — the receiver posts descriptors from exactly
++		 * this shape. The eligibility precheck guarantees it; treat a
++		 * violation as a driver bug rather than corrupting the peer.
++		 */
++		if (zc && payload_count &&
++		    len != min_t(u32, TBV_DATA_FRAME_SIZE,
++				 total_length - prepared)) {
++			WARN_ONCE(1, "zc stream chunk shape violation len=%u prepared=%u total=%u\n",
++				  len, prepared, total_length);
+ 			if (done)
+ 				done(done_ctx, -EIO);
+ 			ret = -EIO;
+ 			goto err_release;
+ 		}
+ 
+-		packet = tbv_path_alloc_zcopy_packet(path, dma, len, true,
++		last = prepared + len == total_length;
++
++		if (!premapped) {
++			dma = dma_map_page(dma_dev, page, page_off, len,
++					   DMA_TO_DEVICE);
++			if (dma_mapping_error(dma_dev, dma)) {
++				if (done)
++					done(done_ctx, -EIO);
++				ret = -EIO;
++				goto err_release;
++			}
++		}
++
++		packet = tbv_path_alloc_zcopy_packet(chunk_path, dma, len,
++						     !premapped,
+ 						     done, done_ctx);
+ 		if (!packet) {
+-			dma_unmap_page(dma_dev, dma, len, DMA_TO_DEVICE);
++			if (!premapped)
++				dma_unmap_page(dma_dev, dma, len,
++					       DMA_TO_DEVICE);
+ 			if (done)
+ 				done(done_ctx, -ENOMEM);
+ 			ret = -ENOMEM;
+ 			goto err_release;
+ 		}
+ 		packet->owner_ctx = meta_done_ctx ? meta_done_ctx : done_ctx;
+-		packet->raw_stream_end = last;
+-		list_add_tail(&packet->node, &packets);
+-		packet_count++;
++		/* raw-gate flags only matter on the shared main path */
++		packet->raw_stream_end = !zc && last;
++		if (!payload_count)
++			first_len = len;
++		list_add_tail(&packet->node, &payloads);
++		payload_count++;
+ 		prepared += len;
+ 	}
+ 
+-	ret = tbv_path_enqueue_data_list(path, &packets, packet_count,
+-					 send_flags & TBV_PATH_SEND_DEFER);
+-	if (ret)
++	hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
++	if (!hdr_buf) {
++		ret = -ENOMEM;
++		goto err_release;
++	}
++
++	stream_hdr = *hdr;
++	stream_hdr.length = total_length;
++	stream_hdr.flags |= TBV_NATIVE_DATA_F_LAST |
++			    TBV_NATIVE_DATA_F_RAW_STREAM;
++	if (zc) {
++		stream_hdr.flags |= TBV_NATIVE_DATA_F_ZC_PATH;
++		stream_hdr.frag_offset = first_len;
++	}
++	ret = tbv_native_data_build_header(hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
++					   &stream_hdr);
++	if (ret < 0) {
++		kfree(hdr_buf);
++		goto err_release;
++	}
++
++	packet = tbv_path_alloc_data_packet_owned(path, hdr_buf,
++						  TBV_NATIVE_DATA_HDR_SIZE,
++						  meta_done, meta_done_ctx);
++	if (!packet) {
++		kfree(hdr_buf);
++		ret = -ENOMEM;
++		goto err_release;
++	}
++	packet->raw_stream_start = !zc;
++	list_add_tail(&packet->node, &packets);
++	packet_count = 1;
++
++	if (!zc) {
++		/* classic: start + payloads as one atomic list on `path` */
++		list_splice_tail_init(&payloads, &packets);
++		packet_count += payload_count;
++		payload_count = 0;
++		ret = tbv_path_enqueue_data_list(path, &packets, packet_count,
++						 send_flags &
++						 TBV_PATH_SEND_DEFER);
++		if (ret)
++			goto err_release;
++		return 0;
++	}
++
++	/*
++	 * zc: start header on the main path, payload on the zc path, both
++	 * under the rail's zc_send_lock so concurrent streams keep matching
++	 * order on the two paths (the receiver posts descriptors in start
++	 * order and both rings are FIFO).
++	 */
++	mutex_lock(&path->rail->zc_send_lock);
++	packet = list_first_entry(&packets, struct tbv_tx_packet, node);
++	list_del_init(&packet->node);
++	packet_count = 0;
++	ret = tbv_path_enqueue_data(path, packet, true);
++	if (ret) {
++		mutex_unlock(&path->rail->zc_send_lock);
++		list_add(&packet->node, &packets);
++		packet_count = 1;
+ 		goto err_release;
++	}
++	start_committed = true;
++	ret = tbv_path_enqueue_reserved_data_list(payload_path, &payloads,
++						  payload_count, true);
++	mutex_unlock(&path->rail->zc_send_lock);
++	if (ret) {
++		/*
++		 * Should be impossible with the reservation; the start header
++		 * is already queued (its meta_done fires on TX completion),
++		 * so the peer will arm and time this stream out. Fail the WR
++		 * via the payload done callbacks.
++		 */
++		pr_warn_ratelimited("zc payload enqueue failed ret=%d after start header queued\n",
++				    ret);
++		goto err_release;
++	}
++	atomic64_inc(&payload_path->zc_tx_streams);
++	tbv_path_release_data_reservation(payload_path,
++					  reserved - payload_count);
++	if (!(send_flags & TBV_PATH_SEND_DEFER)) {
++		tbv_path_schedule_tx(path);
++		tbv_path_schedule_tx(payload_path);
++	}
+ 	return 0;
+ 
+ err_release:
+-	if (!packet_count && meta_done)
++	if (reserved)
++		tbv_path_release_data_reservation(payload_path, reserved);
++	/*
++	 * meta_done fires exactly once: via the start packet's release if it
++	 * exists in `packets`, via its eventual TX completion if it was
++	 * already committed to the queue, or directly here if it was never
++	 * created.
++	 */
++	if (!packet_count && !start_committed && meta_done)
+ 		meta_done(meta_done_ctx, ret);
+ 	tbv_path_release_packet_list(&packets, ret);
++	tbv_path_release_packet_list(&payloads, ret);
+ 	return ret;
+ 
+ err_meta_done:
+@@ -2407,6 +3235,170 @@
+ 	return ret;
+ }
+ 
++/*
++ * Option A (DRAFT): per-fragment header-framed zero-copy for RC writes. Builds
++ * an interleaved [header, payload] list and enqueues it atomically so the two
++ * frames of each chunk stay adjacent and in order on the FIFO TX ring (a
++ * concurrent sender's splice can never land between a header and its payload).
++ * Every header frame carries a full native header (with F_SPLIT_PAYLOAD), so an
++ * RC retransmit re-addresses its own chunk and can never be mistaken for raw
++ * bytes — the property that makes the whole-message raw stream UC-only.
++ *
++ * Refcounting mirrors tbv_path_send_page_stream: @next takes each payload
++ * frame's ref + done, @hdr_prep takes each header frame's ref + done. On any
++ * error, tbv_path_release_packet_list() fires every queued frame's done exactly
++ * once (dropping its ref); frames not yet created have their done fired inline.
++ */
++int tbv_path_send_split_write(struct tbv_path *path, u32 total_length,
++			      u32 chunk_frames,
++			      unsigned int send_flags,
++			      tbv_path_next_page_fn next, void *next_ctx,
++			      tbv_path_split_hdr_fn hdr_prep, void *hdr_ctx)
++{
++	struct device *dma_dev;
++	LIST_HEAD(list);
++	u32 prepared = 0;
++	u32 count = 0;
++	int ret;
++
++	if (!path || !next || !hdr_prep)
++		return -EINVAL;
++	if (!path->tx_ring)
++		return -ENOTCONN;
++	if (!total_length || total_length > TBV_NATIVE_DATA_MAX_MSG_SIZE)
++		return -EMSGSIZE;
++	if (send_flags & ~TBV_PATH_SEND_DEFER)
++		return -EINVAL;
++	chunk_frames = clamp_t(u32, chunk_frames, 1,
++			       TBV_NATIVE_DATA_SPLIT_MAX_FRAMES);
++
++	dma_dev = tb_ring_dma_device(path->tx_ring);
++	if (!tbv_dma_device_ready(dma_dev))
++		return -EPROBE_DEFER;
++
++	while (prepared < total_length) {
++		void *hdone_ctx = NULL;
++		tbv_path_tx_done_fn hdone = NULL;
++		struct tbv_tx_packet *hpkt;
++		LIST_HEAD(chunk);
++		u32 chunk_start = prepared;
++		u32 chunk_len = 0;
++		u32 nframes = 0;
++		bool last;
++		u8 *hbuf;
++
++		/*
++		 * Gather up to chunk_frames zero-copy payload frames; ONE 48B
++		 * header then describes them all, amortizing both the header
++		 * descriptor and the receiver's pairing state over the chunk.
++		 */
++		while (nframes < chunk_frames && prepared < total_length) {
++			struct page *page = NULL;
++			void *pdone_ctx = NULL;
++			tbv_path_tx_done_fn pdone = NULL;
++			struct tbv_tx_packet *ppkt;
++			dma_addr_t dma = 0;
++			u32 page_off = 0;
++			u32 len = 0;
++			bool premapped;
++
++			ret = next(next_ctx, &page, &page_off, &dma, &len,
++				   &pdone, &pdone_ctx);
++			if (ret)
++				goto err_chunk;
++			premapped = !page && dma;
++			if ((!page && !premapped) || !len ||
++			    len > TBV_DATA_FRAME_SIZE ||
++			    len > total_length - prepared ||
++			    (!premapped &&
++			     (page_off > PAGE_SIZE ||
++			      len > PAGE_SIZE - page_off))) {
++				if (pdone)
++					pdone(pdone_ctx, -EINVAL);
++				ret = -EINVAL;
++				goto err_chunk;
++			}
++
++			if (!premapped) {
++				dma = dma_map_page(dma_dev, page, page_off,
++						   len, DMA_TO_DEVICE);
++				if (dma_mapping_error(dma_dev, dma)) {
++					if (pdone)
++						pdone(pdone_ctx, -EIO);
++					ret = -EIO;
++					goto err_chunk;
++				}
++			}
++			ppkt = tbv_path_alloc_zcopy_packet(path, dma, len,
++							   !premapped,
++							   pdone, pdone_ctx);
++			if (!ppkt) {
++				if (!premapped)
++					dma_unmap_page(dma_dev, dma, len,
++						       DMA_TO_DEVICE);
++				if (pdone)
++					pdone(pdone_ctx, -ENOMEM);
++				ret = -ENOMEM;
++				goto err_chunk;
++			}
++			/*
++			 * Payload frames carry no gate flags: each drain
++			 * decrements the pair latch armed by the header.
++			 */
++			list_add_tail(&ppkt->node, &chunk);
++			nframes++;
++			chunk_len += len;
++			prepared += len;
++		}
++		last = prepared == total_length;
++
++		/* Chunk header (48B, F_SPLIT_PAYLOAD, length = chunk bytes). */
++		hbuf = kmalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
++		if (!hbuf) {
++			ret = -ENOMEM;
++			goto err_chunk;
++		}
++		ret = hdr_prep(hdr_ctx, hbuf, TBV_NATIVE_DATA_HDR_SIZE,
++			       chunk_start, chunk_len, last, &hdone,
++			       &hdone_ctx);
++		if (ret) {
++			kfree(hbuf);
++			goto err_chunk;
++		}
++		hpkt = tbv_path_alloc_data_packet_owned(path, hbuf,
++						TBV_NATIVE_DATA_HDR_SIZE,
++						hdone, hdone_ctx);
++		if (!hpkt) {
++			kfree(hbuf);
++			if (hdone)
++				hdone(hdone_ctx, -ENOMEM);
++			ret = -ENOMEM;
++			goto err_chunk;
++		}
++		hpkt->raw_pair_start = true;
++		hpkt->raw_pair_frames = nframes;
++		list_add_tail(&hpkt->node, &list);
++		list_splice_tail_init(&chunk, &list);
++		count += 1 + nframes;
++		continue;
++
++err_chunk:
++		list_splice_tail_init(&chunk, &list);
++		goto err;
++	}
++
++	ret = tbv_path_enqueue_data_list(path, &list, count,
++					 send_flags & TBV_PATH_SEND_DEFER);
++	if (ret)
++		goto err;
++	return 0;
++
++err:
++	/* Fires each already-created frame's done exactly once. */
++	tbv_path_release_packet_list(&list, ret);
++	return ret;
++}
++
+ static bool tbv_path_packet_matches(const struct tbv_tx_packet *packet,
+ 				    tbv_path_tx_done_fn done, void *done_ctx,
+ 				    void *owner_ctx)
+@@ -2440,12 +3432,19 @@
+ 		return;
+ 
+ 	spin_lock_irqsave(&path->tx_lock, flags);
++	if (owner_ctx && path->tx_raw_pair_pending &&
++	    path->tx_raw_pair_owner == owner_ctx) {
++		path->tx_raw_pair_pending = false;
++		path->tx_raw_pair_owner = NULL;
++		path->tx_raw_pair_remaining = 0;
++	}
+ 	if (owner_ctx && path->tx_raw_stream_active &&
+ 	    path->tx_raw_stream_owner == owner_ctx) {
+ 		path->tx_raw_stream_active = false;
+ 		path->tx_raw_stream_owner = NULL;
+ 		path->tx_raw_stream_end_seen = false;
+ 		path->tx_raw_stream_inflight = 0;
++		path->tx_raw_stream_mid_pair = false;
+ 		raw_stream_canceled = true;
+ 	}
+ 	list_for_each_entry_safe(packet, tmp, &path->tx_data_queue, node) {
+@@ -2528,6 +3527,10 @@
+ 	path->tx_raw_stream_owner = NULL;
+ 	path->tx_raw_stream_end_seen = false;
+ 	path->tx_raw_stream_inflight = 0;
++	path->tx_raw_stream_mid_pair = false;
++	path->tx_raw_pair_pending = false;
++	path->tx_raw_pair_owner = NULL;
++	path->tx_raw_pair_remaining = 0;
+ 	spin_unlock_irqrestore(&path->tx_lock, flags);
+ 
+ 	while (!list_empty(&control)) {
+@@ -2555,6 +3558,7 @@
+ 
+ 	cancel_delayed_work_sync(&path->tx_poll_work);
+ 	cancel_delayed_work_sync(&path->rx_supp_poll_work);
++	cancel_work_sync(&path->rx_ring_work);
+ 
+ 	if (tunnel_enabled) {
+ 		int ret = tbv_path_disable_tunnel(path, xd);
+@@ -2582,7 +3586,27 @@
+ 
+ 	tbv_path_flush_tx_queue(path, -ECANCELED);
+ 
++	/*
++	 * Re-cancel after the rings are stopped: an RX ring IRQ may have
++	 * requeued rx_ring_work between the first cancel and tb_ring_stop().
++	 * With the ring stopped no new IRQ can arrive, so this is final.
++	 */
++	cancel_work_sync(&path->rx_ring_work);
++
+ 	if (path->rx_ring) {
++		if (path->zc_rx) {
++			/*
++			 * Ring stopped and its work drained: all zc
++			 * descriptors have seen their (canceled) completions,
++			 * so streams can be retired and the pools dissolved.
++			 */
++			tbv_path_zc_flush(path);
++			kvfree(path->zc_descs);
++			path->zc_descs = NULL;
++			path->zc_desc_count = 0;
++			INIT_LIST_HEAD(&path->zc_free_descs);
++			INIT_LIST_HEAD(&path->zc_free_bounce);
++		}
+ 		tbv_path_free_frames(path, false);
+ 		tb_ring_free(path->rx_ring);
+ 		path->rx_ring = NULL;
+--- a/kernel/peer.c
++++ b/kernel/peer.c
+@@ -237,6 +237,8 @@
+ 	rail->native_tunnel_attempts = 0;
+ 	rail->native_ready_sent = false;
+ 	rail->native_remote_ready = false;
++	rail->zc_remote_transmit_path = -1;
++	mutex_init(&rail->zc_send_lock);
+ 	tbv_native_control_init_rail(rail, peer);
+ 	tbv_path_default_config(peer->backend, &path_cfg);
+ 	if (peer->backend == TBV_BACKEND_NATIVE &&
+@@ -252,6 +254,15 @@
+ 		path_cfg.e2e = true;
+ 	}
+ 	tbv_path_init(&rail->path, &path_cfg, rail);
++	/*
++	 * Zero-copy payload path: plain FRAME rings, no E2E (see the AMD NHI
++	 * wedge note above) — flow control is the software zc credit scheme
++	 * (receiver grants as it posts destination buffers). Rings are only
++	 * allocated for native rails when the feature is on (service probe).
++	 */
++	tbv_path_default_config(peer->backend, &path_cfg);
++	tbv_path_init(&rail->zc_path, &path_cfg, rail);
++	rail->zc_path.zc_rx = true;
+ 
+ 	mutex_lock(&peer->state->lock);
+ 	if (peer->backend == TBV_BACKEND_NATIVE &&
+@@ -343,6 +354,12 @@
+ 	}
+ 	mutex_unlock(&peer->state->lock);
+ 
++	/*
++	 * The zc path goes first: its RX engine delivers into QPs/MRs via the
++	 * main path's identity and its descriptors reference dma-buf MR
++	 * mappings; retire all of that while the main path still exists.
++	 */
++	tbv_path_destroy(&rail->zc_path, peer->xd);
+ 	tbv_path_destroy(&rail->path, peer->xd);
+ 	ida_free(&peer->rail_ids, rail->rail_id);
+ 	kfree(rail);
+--- a/kernel/service.c
++++ b/kernel/service.c
+@@ -465,6 +465,27 @@
+ 
+ 			if (backend == TBV_BACKEND_NATIVE &&
+ 			    tbv_service_state->negotiate_native) {
++				/*
++				 * Zero-copy payload path rings: best-effort; a
++				 * failure just leaves zc off for this rail
++				 * (raw streams stay on the main path).
++				 */
++				ret = tbv_path_alloc_rings(&rail->zc_path, xd,
++							   -1);
++				if (!ret)
++					ret = tbv_path_start_rings(&rail->zc_path);
++				if (!ret) {
++					rail->zc_rings_ready = true;
++					pr_info("zc path rings ready service id=%d tx_hop=%d rx_hop=%d out_hop=%d\n",
++						svc->id,
++						rail->zc_path.tx_ring->hop,
++						rail->zc_path.rx_ring->hop,
++						rail->zc_path.local_transmit_path);
++				} else {
++					pr_warn("zc path ring setup failed ret=%d; zero-copy RX disabled for this rail\n",
++						ret);
++					ret = 0;
++				}
+ 				tbv_native_control_queue_rail(tbv_service_state,
+ 							      rail);
+ 			} else if (backend == TBV_BACKEND_APPLE &&
+--- a/kernel/tbv.h
++++ b/kernel/tbv.h
+@@ -152,12 +152,32 @@
+ 	bool e2e;
+ };
+ 
++/*
++ * Fill a native data frame (48B header + payload) directly into the pre-mapped
++ * TX ring staging buffer at drain time, instead of memcpy-ing it out of an
++ * intermediate kmalloc'd frame. frag_offset/last identify the fragment so the
++ * callback can rebuild the header and gather the MR payload straight into dst.
++ * Runs in workqueue (process) context with no path locks held. Returns 0, or a
++ * negative errno that is fatal to the owning send.
++ */
++typedef int (*tbv_path_tx_frame_fill_fn)(void *ctx, void *dst, u32 dst_len,
++					 u32 frag_offset, bool last);
++
+ struct tbv_path_owned_frame {
+ 	struct list_head node;
+ 	void *data;
+ 	u32 len;
+ 	u8 sof;
+ 	u8 eof;
++	/*
++	 * When fill != NULL, data is NULL and the frame body is produced
++	 * directly into the ring buffer by fill() at TX time (removes the
++	 * per-fragment kmalloc and the stage memcpy).
++	 */
++	tbv_path_tx_frame_fill_fn fill;
++	void *fill_ctx;
++	u32 fill_offset;
++	bool fill_last;
+ };
+ 
+ struct tbv_path {
+@@ -190,6 +210,7 @@
+ 	struct list_head tx_zcopy_inflight;
+ 	struct delayed_work tx_poll_work;
+ 	struct delayed_work rx_supp_poll_work;
++	struct work_struct rx_ring_work;
+ 	atomic_t tx_inflight;
+ 	atomic64_t data_tx_enqueued;
+ 	atomic64_t data_tx_posted;
+@@ -209,6 +230,9 @@
+ 	atomic64_t tx_poll_completed;
+ 	atomic64_t rx_supp_poll_calls;
+ 	atomic64_t rx_supp_poll_completed;
++	atomic64_t rx_ring_work_calls;
++	atomic64_t rx_ring_work_completed;
++	atomic64_t rx_ring_work_race_frames;
+ 	unsigned long rx_supp_poll_until;
+ 	u8 rx_raw_opcode;
+ 	u8 rx_raw_flags;
+@@ -221,17 +245,68 @@
+ 	u32 rx_raw_remaining;
+ 	u64 rx_raw_base;
+ 	bool rx_raw_pending;
++	/*
++	 * Option A: a received F_SPLIT_PAYLOAD header is stashed here (kmemdup)
++	 * and rx_split_pending is set; the very next frame on this path is that
++	 * header's payload. Serialized by the single-threaded RX completion.
++	 */
++	struct tbv_native_data_header *rx_split_hdr;
++	bool rx_split_pending;
++	/* Multi-frame chunks: bytes of the stashed header not yet consumed,
++	 * and bytes already dispatched (source of the sub-frame offsets). */
++	u32 rx_split_remaining;
++	u32 rx_split_consumed;
+ 	bool tx_poll_enabled;
+ 	bool rx_supp_poll_enabled;
++	bool rx_poll_mode_active;
+ 	bool tx_scheduling;
+ 	bool tx_raw_stream_active;
+ 	bool tx_raw_stream_end_seen;
++	/*
++	 * True between draining a raw_stream_start header and draining the
++	 * same owner's following frame: the only window where nothing may
++	 * interpose on the wire (a split header must be immediately followed
++	 * by its payload). Between pairs the gate may release safely.
++	 */
++	bool tx_raw_stream_mid_pair;
+ 	u32 tx_raw_stream_inflight;
+ 	void *tx_raw_stream_owner;
++	/*
++	 * Split-pair latch: set while a raw_pair_start header is on the ring
++	 * and its payload is not. Blocks every other frame for that window
++	 * only; no completion tracking. Independent of the raw-stream gate.
++	 */
++	bool tx_raw_pair_pending;
++	void *tx_raw_pair_owner;
++	u32 tx_raw_pair_remaining;
+ 	int local_transmit_path;
+ 	int local_tx_hop;
+ 	int local_rx_hop;
+ 	int remote_transmit_path;
++	/*
++	 * Zero-copy payload path state (set on rail->zc_path only). The RX
++	 * ring is NOT auto-posted at start; the zc RX engine posts
++	 * destination-MR pages (or bounce frames) per raw stream, strictly in
++	 * stream-arrival order, and grants the sender software credits (sent
++	 * on the rail's MAIN path via TBV_NATIVE_DATA_OP_ZC_PATH_CREDIT) as
++	 * descriptors are posted — so payload frames can never outrun posted
++	 * buffers. zc_lock protects the stream list, pools and post cursors.
++	 */
++	bool zc_rx;
++	spinlock_t zc_lock;
++	struct list_head zc_streams;
++	struct list_head zc_free_descs;
++	struct list_head zc_free_bounce;
++	struct tbv_zc_rx_desc *zc_descs;
++	u32 zc_desc_count;
++	u32 zc_credit_pending;
++	atomic64_t zc_rx_streams;
++	atomic64_t zc_rx_placed;
++	atomic64_t zc_rx_bounced;
++	atomic64_t zc_rx_bad_frame;
++	atomic64_t zc_rx_stream_errors;
++	atomic64_t zc_credit_send_error;
++	atomic64_t zc_tx_streams;
+ };
+ 
+ struct tbv_rail {
+@@ -240,6 +315,32 @@
+ 	struct tbv_state *native_work_state;
+ 	struct tbv_rail_key key;
+ 	struct tbv_path path;
++	/*
++	 * Dedicated zero-copy payload path (native rails only; second DMA
++	 * ring pair + tunnel on the same xdomain). Raw-stream WRITE payload is
++	 * routed here so the receiver can post the destination MR's pages as
++	 * RX frame buffers (NHI places data, no CPU copy) while ALL control
++	 * (start headers, acks, credits) stays on rail->path — nothing may
++	 * ever interleave into the payload-only ring. Negotiated post-ready
++	 * via TBV_NATIVE_WIRE_OP_ZC_HELLO; fully optional (either side
++	 * missing/refusing it just keeps raw streams on the main path).
++	 */
++	struct tbv_path zc_path;
++	/*
++	 * Orders (start-hdr on path, payload on zc_path) enqueue pairs across
++	 * QPs so the start order on the main path always matches the payload
++	 * group order on the zc path — the receiver posts descriptors in
++	 * start-arrival order and the rings are FIFO.
++	 */
++	struct mutex zc_send_lock;
++	u32 remote_caps;
++	u32 zc_remote_rx_ring_size;
++	u32 zc_remote_tx_hop;
++	int zc_remote_transmit_path;
++	u32 zc_attempts;
++	bool zc_rings_ready;
++	bool zc_negotiated;
++	bool zc_remote_enabled;
+ 	struct delayed_work native_work;
+ 	refcount_t refcnt;
+ 	struct completion refs_zero;
+@@ -635,16 +736,34 @@
+ struct tbv_data_frame;
+ struct tbv_native_data_header;
+ struct tbv_tx_packet;
++struct tbv_zc_rx_desc;
+ struct device;
+ struct page;
+ struct tb_ring;
+ struct tb_xdomain;
+ typedef void (*tbv_path_tx_done_fn)(void *ctx, int status);
+ typedef int (*tbv_path_tx_fill_fn)(void *ctx, void *dst, u32 len);
++/*
++ * Yield the next payload chunk for a raw zero-copy stream. Either a struct
++ * page (page + page_off; the sender DMA-maps and later unmaps it) or, for
++ * memory that is already DMA-mapped for the NHI (dma-buf MRs), a pre-mapped
++ * bus address in *dma with *page == NULL (the sender uses it as-is and must
++ * not unmap it — the MR's mapping owns it).
++ */
+ typedef int (*tbv_path_next_page_fn)(void *ctx, struct page **page,
+-				     u32 *page_off, u32 *length,
++				     u32 *page_off, dma_addr_t *dma,
++				     u32 *length,
+ 				     tbv_path_tx_done_fn *done,
+ 				     void **done_ctx);
++/*
++ * Option A: build the 48B F_SPLIT_PAYLOAD header for one chunk into @dst and,
++ * symmetrically with tbv_path_next_page_fn, take this header frame's own
++ * completion reference and yield its done/done_ctx. frag_offset/chunk_len/last
++ * describe the payload that will ride the immediately following frame.
++ */
++typedef int (*tbv_path_split_hdr_fn)(void *ctx, void *dst, u32 dst_len,
++				     u32 frag_offset, u32 chunk_len, bool last,
++				     tbv_path_tx_done_fn *done, void **done_ctx);
+ #define TBV_PATH_SEND_CONTROL	BIT(0)
+ #define TBV_PATH_SEND_DEFER	BIT(1)
+ extern const uuid_t tbv_native_service_uuid;
+@@ -683,6 +802,15 @@
+ 			       struct tbv_path *rx_path,
+ 			       const struct tbv_native_data_header *hdr,
+ 			       const void *payload);
++/*
++ * Option A: deliver a split-payload fragment. @hdr is the previously received
++ * F_SPLIT_PAYLOAD header (still carrying the flag); @payload/@len is the
++ * separate payload frame that followed it on the same path.
++ */
++void tbv_ibdev_rx_split_payload(struct tbv_state *state,
++				struct tbv_path *rx_path,
++				const struct tbv_native_data_header *hdr,
++				const void *payload, u32 len);
+ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
+ 			      const struct tbv_path *path,
+ 			      const void *payload, u32 len, u8 sof, u8 eof);
+@@ -776,6 +904,7 @@
+ 			   int remote_transmit_path);
+ int tbv_path_disable_tunnel(struct tbv_path *path, struct tb_xdomain *xd);
+ void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size);
++void tbv_path_set_zc_remote_capacity(struct tbv_path *path, u32 rx_ring_size);
+ void tbv_path_add_remote_rx_credits(struct tbv_path *path, u32 credits);
+ int tbv_path_reserve_data(struct tbv_path *path, u32 frames);
+ void tbv_path_release_data_reservation(struct tbv_path *path, u32 frames);
+@@ -810,12 +939,53 @@
+ 			      u8 sof, u8 eof, unsigned int flags,
+ 			      tbv_path_tx_fill_fn fill, void *fill_ctx,
+ 			      tbv_path_tx_done_fn done, void *done_ctx);
++/*
++ * payload_path == NULL (or == path): classic single-path raw stream. When a
++ * distinct zc payload path is given, the start header goes on `path` with
++ * TBV_NATIVE_DATA_F_ZC_PATH (frag_offset = first chunk length) and the
++ * payload frames are enqueued on `payload_path`; both enqueues happen under
++ * the rail's zc_send_lock so cross-QP stream order matches on both paths.
++ */
+ int tbv_path_send_page_stream(struct tbv_path *path,
++			      struct tbv_path *payload_path,
+ 			      const struct tbv_native_data_header *hdr,
+ 			      u32 total_length, unsigned int flags,
+ 			      tbv_path_tx_done_fn meta_done,
+ 			      void *meta_done_ctx,
+ 			      tbv_path_next_page_fn next, void *next_ctx);
++/*
++ * Option A (DRAFT, 2-node): emit, on a single path, an interleaved sequence of
++ * [48B F_SPLIT_PAYLOAD header frame, DMA-mapped payload frame] pairs — one pair
++ * per chunk from @next — as one atomic FIFO list. Keeps a full per-fragment
++ * header (RC-retransmit-safe) while the payload rides its own frame with no CPU
++ * copy. @hdr_prep fills each header and takes its frame's completion ref; @next
++ * yields each payload chunk and takes its ref (see tbv_path_send_page_stream).
++ */
++int tbv_path_send_split_write(struct tbv_path *path, u32 total_length,
++			      u32 chunk_frames,
++			      unsigned int send_flags,
++			      tbv_path_next_page_fn next, void *next_ctx,
++			      tbv_path_split_hdr_fn hdr_prep, void *hdr_ctx);
++/* Sender-side gate: zc payload routing usable on this rail right now. */
++bool tbv_rail_zc_tx_ready(struct tbv_rail *rail);
++/* Build-time/runtime support gate (zc RX needs poll-mode ring servicing). */
++bool tbv_path_zc_supported(void);
++/* Called from the main path's RX work on a raw start with F_ZC_PATH set. */
++void tbv_path_zc_rx_arm(struct tbv_state *state, struct tbv_rail *rail,
++			const struct tbv_native_data_header *hdr);
++/* Fail + free all zc RX streams (tunnel down / teardown). */
++void tbv_path_zc_flush(struct tbv_path *path);
++/*
++ * ibdev services for the zc RX engine: resolve/hold the destination MR of an
++ * incoming zc write stream, translate per-chunk IOVAs to NHI bus addresses,
++ * and drop the reference when the stream retires. mr_handle is an opaque
++ * ref-held pointer (NULL = no usable MR; engine bounces the whole stream).
++ */
++void *tbv_ibdev_zc_stream_begin(struct tbv_state *state,
++				const struct tbv_native_data_header *hdr);
++int tbv_ibdev_zc_chunk_dma(void *mr_handle, u64 iova, u32 len,
++			   dma_addr_t *dma_out);
++void tbv_ibdev_zc_stream_end(void *mr_handle);
+ void tbv_path_kick_tx(struct tbv_path *path);
+ void tbv_path_cancel_data_done_ctx(struct tbv_path *path,
+ 				   tbv_path_tx_done_fn done, void *done_ctx);
+--- a/proto/native_data.h
++++ b/proto/native_data.h
+@@ -12,6 +12,8 @@
+ 	(TBV_NATIVE_DATA_FRAME_SIZE - TBV_NATIVE_DATA_HDR_SIZE)
+ #define TBV_NATIVE_DATA_MAX_MSG_SIZE	(16u * 1024u * 1024u)
+ #define TBV_NATIVE_DATA_CREDIT_BATCH	32u
++/* Max payload frames one F_SPLIT_PAYLOAD header may describe (chunk cap). */
++#define TBV_NATIVE_DATA_SPLIT_MAX_FRAMES 64u
+ #define TBV_NATIVE_DATA_MAX_FRAGS \
+ 	((TBV_NATIVE_DATA_MAX_MSG_SIZE + TBV_NATIVE_DATA_MAX_PAYLOAD - 1u) / \
+ 	 TBV_NATIVE_DATA_MAX_PAYLOAD)
+@@ -28,15 +30,58 @@
+ 	TBV_NATIVE_DATA_OP_PATH_CREDIT = 9,
+ 	TBV_NATIVE_DATA_OP_RDMA_READ_ACK = 10,
+ 	TBV_NATIVE_DATA_OP_MAD = 11,
+-	TBV_NATIVE_DATA_OP_MAX = TBV_NATIVE_DATA_OP_MAD,
++	/*
++	 * Like PATH_CREDIT but grants TX credits for the rail's zero-copy
++	 * payload path. Sent on the MAIN path (the zc path carries payload
++	 * frames only) by the zc RX engine as it posts destination buffers,
++	 * so the peer's zc TX can never outrun posted descriptors.
++	 */
++	TBV_NATIVE_DATA_OP_ZC_PATH_CREDIT = 12,
++	TBV_NATIVE_DATA_OP_MAX = TBV_NATIVE_DATA_OP_ZC_PATH_CREDIT,
+ };
+ 
+ enum tbv_native_data_flag {
+ 	TBV_NATIVE_DATA_F_LAST = 1u << 0,
+ 	TBV_NATIVE_DATA_F_SOLICITED = 1u << 1,
+ 	TBV_NATIVE_DATA_F_RAW_STREAM = 1u << 2,
++	/*
++	 * Raw-stream start header only: the payload frames follow on the
++	 * rail's dedicated zero-copy DMA path instead of this path. The
++	 * receiver posts the destination MR's pages as that path's RX frame
++	 * buffers so the NHI places payload directly (no CPU copy). For these
++	 * start headers frag_offset carries the FIRST payload chunk length;
++	 * subsequent chunks are TBV_NATIVE_DATA_FRAME_SIZE until the tail.
++	 */
++	TBV_NATIVE_DATA_F_ZC_PATH = 1u << 3,
++	/*
++	 * Option A (RC header-framed zero-copy): this 48B header frame is
++	 * immediately followed on the SAME path by hdr->length bytes of
++	 * separate payload frames (up to SPLIT_MAX_FRAMES of them,
++	 * page-aligned, DMA-mapped MR pages, no CPU copy). Unlike F_RAW_STREAM this keeps a full per-fragment header, so
++	 * an RC retransmit re-addresses its own chunk and can never be confused
++	 * with raw user bytes. The receiver pairs the stored header with the
++	 * next frame's bytes. BOTH nodes must understand this flag.
++	 */
++	TBV_NATIVE_DATA_F_SPLIT_PAYLOAD = 1u << 4,
+ };
+ 
++/*
++ * Max payload byte count a header may advertise. A normal fragment carries its
++ * payload contiguously after the 48B header (<= MAX_PAYLOAD). F_RAW_STREAM
++ * start headers cover a whole message. F_SPLIT_PAYLOAD headers describe a
++ * payload that rides a separate frame, so it may be up to a full FRAME_SIZE.
++ */
++static inline tbv_wire_u32
++tbv_native_data_max_len_for_flags(tbv_wire_u8 flags)
++{
++	if (flags & TBV_NATIVE_DATA_F_RAW_STREAM)
++		return TBV_NATIVE_DATA_MAX_MSG_SIZE;
++	if (flags & TBV_NATIVE_DATA_F_SPLIT_PAYLOAD)
++		return TBV_NATIVE_DATA_SPLIT_MAX_FRAMES *
++		       TBV_NATIVE_DATA_FRAME_SIZE;
++	return TBV_NATIVE_DATA_MAX_PAYLOAD;
++}
++
+ enum tbv_native_read_ack_status {
+ 	TBV_NATIVE_READ_ACK_OK = 0,
+ 	TBV_NATIVE_READ_ACK_RETRY = 1,
+@@ -104,9 +149,7 @@
+ 		return -ENOSPC;
+ 	if (!hdr->opcode || hdr->opcode > TBV_NATIVE_DATA_OP_MAX)
+ 		return -EINVAL;
+-	if (hdr->length > ((hdr->flags & TBV_NATIVE_DATA_F_RAW_STREAM) ?
+-			   TBV_NATIVE_DATA_MAX_MSG_SIZE :
+-			   TBV_NATIVE_DATA_MAX_PAYLOAD))
++	if (hdr->length > tbv_native_data_max_len_for_flags(hdr->flags))
+ 		return -EMSGSIZE;
+ 
+ 	memset(p, 0, TBV_NATIVE_DATA_HDR_SIZE);
+@@ -162,9 +205,7 @@
+ 
+ 	if (!hdr->opcode || hdr->opcode > TBV_NATIVE_DATA_OP_MAX)
+ 		return -EINVAL;
+-	if (hdr->length > ((hdr->flags & TBV_NATIVE_DATA_F_RAW_STREAM) ?
+-			   TBV_NATIVE_DATA_MAX_MSG_SIZE :
+-			   TBV_NATIVE_DATA_MAX_PAYLOAD))
++	if (hdr->length > tbv_native_data_max_len_for_flags(hdr->flags))
+ 		return -EMSGSIZE;
+ 
+ 	return 0;
+@@ -186,6 +227,7 @@
+ 
+ 	*payload = *stream;
+ 	payload->flags &= ~(TBV_NATIVE_DATA_F_RAW_STREAM |
++			    TBV_NATIVE_DATA_F_ZC_PATH |
+ 			    TBV_NATIVE_DATA_F_LAST |
+ 			    TBV_NATIVE_DATA_F_SOLICITED);
+ 	if (payload_len == remaining)
+--- a/proto/native_wire.h
++++ b/proto/native_wire.h
+@@ -41,12 +41,28 @@
+ 	TBV_NATIVE_WIRE_OP_HELLO_ACK = 2,
+ 	TBV_NATIVE_WIRE_OP_READY = 3,
+ 	TBV_NATIVE_WIRE_OP_READY_ACK = 4,
++	/*
++	 * Zero-copy payload path negotiation. Reuses the hello payload, but the
++	 * tx_hop/rx_hop/transmit_path/ring fields describe the rail's SECOND
++	 * (payload-only) DMA path. Old peers reject the unknown op and simply
++	 * never enable the zc path — full backward compatibility.
++	 */
++	TBV_NATIVE_WIRE_OP_ZC_HELLO = 5,
++	TBV_NATIVE_WIRE_OP_ZC_HELLO_ACK = 6,
+ };
+ 
+ enum tbv_native_wire_cap {
+ 	TBV_NATIVE_WIRE_CAP_UC = 1u << 0,
+ 	TBV_NATIVE_WIRE_CAP_RC = 1u << 1,
+ 	TBV_NATIVE_WIRE_CAP_MULTI_RAIL = 1u << 2,
++	/* Advertised in the main HELLO: this side has zc-path rings ready. */
++	TBV_NATIVE_WIRE_CAP_ZC_PATH = 1u << 3,
++	/*
++	 * Advertised in ZC_HELLO/ZC_HELLO_ACK: this side's zc tunnel is
++	 * enabled (safe to receive payload on it). Each side keeps requesting
++	 * until it has seen the peer's enabled bit.
++	 */
++	TBV_NATIVE_WIRE_CAP_ZC_ENABLED = 1u << 4,
+ };
+ 
+ enum tbv_native_wire_path_flag {
+@@ -159,7 +175,9 @@
+ 	if (op != TBV_NATIVE_WIRE_OP_HELLO &&
+ 	    op != TBV_NATIVE_WIRE_OP_HELLO_ACK &&
+ 	    op != TBV_NATIVE_WIRE_OP_READY &&
+-	    op != TBV_NATIVE_WIRE_OP_READY_ACK)
++	    op != TBV_NATIVE_WIRE_OP_READY_ACK &&
++	    op != TBV_NATIVE_WIRE_OP_ZC_HELLO &&
++	    op != TBV_NATIVE_WIRE_OP_ZC_HELLO_ACK)
+ 		return -EINVAL;
+ 
+ 	if (size < TBV_NATIVE_WIRE_HELLO_MSG_SIZE)
+@@ -213,7 +231,9 @@
+ 	if (tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_HELLO &&
+ 	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_HELLO_ACK &&
+ 	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_READY &&
+-	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_READY_ACK)
++	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_READY_ACK &&
++	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_ZC_HELLO &&
++	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_ZC_HELLO_ACK)
+ 		return -EINVAL;
+ 
+ 	if (info) {
+@@ -234,7 +254,9 @@
+ 	if (op != TBV_NATIVE_WIRE_OP_HELLO &&
+ 	    op != TBV_NATIVE_WIRE_OP_HELLO_ACK &&
+ 	    op != TBV_NATIVE_WIRE_OP_READY &&
+-	    op != TBV_NATIVE_WIRE_OP_READY_ACK)
++	    op != TBV_NATIVE_WIRE_OP_READY_ACK &&
++	    op != TBV_NATIVE_WIRE_OP_ZC_HELLO &&
++	    op != TBV_NATIVE_WIRE_OP_ZC_HELLO_ACK)
+ 		return -EINVAL;
+ 
+ 	if (op != tbv_wire_get_le32((const tbv_wire_u8 *)buf + 28))

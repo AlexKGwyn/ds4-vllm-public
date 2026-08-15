@@ -1,0 +1,18 @@
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
+index f35b98edc0..25bb527ad6 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
+@@ -148,6 +148,13 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(hsa_signal_condition_t condition
+   uint64_t event_age = core::Runtime::runtime_singleton_->KfdVersion().supports_event_age ? 1 : 0;
+   if (!event_age && prior != 0) wait_hint = HSA_WAIT_STATE_ACTIVE;
+ 
++  // The HSA wait state is explicitly a hint. Indefinite background waits are
++  // better served by KFD interrupts than by dedicating a CPU core to active
++  // polling. Finite active waits keep their latency-oriented behavior.
++  if (wait_hint == HSA_WAIT_STATE_ACTIVE && timeout == uint64_t(-1)) {
++    wait_hint = HSA_WAIT_STATE_BLOCKED;
++  }
++
+   const timer::fast_clock::time_point start_time = timer::fast_clock::now();
+   const timer::fast_clock::duration fast_timeout = timer::GetFastTimeout(timeout);
+   const timer::fast_clock::duration kMaxElapsed = std::chrono::microseconds(200);

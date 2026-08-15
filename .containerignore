@@ -1,0 +1,10 @@
+.git
+host/bench/results
+ray-tmp
+# Never let bytecode into the build context: the Dockerfile COPYs
+# container/rootfs/ wholesale, and a stray __pycache__ (e.g. from running
+# `python3 -m py_compile` on an overlay file) would be baked into the image
+# and shadow the source it was compiled from. The Dockerfile's own cleanup
+# only sweeps the vllm/ and aiter/ trees, not the venv top-level modules.
+__pycache__
+*.pyc

@@ -1,0 +1,17 @@
+[Unit]
+Description=USB4 RDMA (RoCE) bring-up + NHI interrupt throttle (8us)
+Documentation=see ~/thunderbolt-ibverbs and ~/nhi-throttle-mod
+After=network-online.target
+Wants=network-online.target
+# The cluster's user services poll for the usb4_rdma device themselves, so
+# strict ordering vs the user manager isn't needed — this just runs at boot.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/bash /var/lib/tbv/tbv-roce-boot.sh
+# Bring-up depends on the peer box; give it room and retry on transient failure.
+TimeoutStartSec=400
+
+[Install]
+WantedBy=multi-user.target

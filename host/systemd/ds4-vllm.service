@@ -1,0 +1,23 @@
+[Unit]
+Description=DeepSeek-V4-Flash vLLM TP=2 cluster (disk KV) — bringup on both boxes
+
+# The systemd handle on the whole 2-box stack. start runs the validated bringup
+# (teardown -> ray head box1 + worker box2 -> vllm serve as the transient
+# ds4-vllm-manual unit -> API/RDMA verify); stop tears everything down on both
+# boxes. router-mode.sh / the StatusMonitor launch button drive this unit.
+#
+# No [Install]: the model takes minutes to load and claims both GPUs, so the
+# stack comes up only on an explicit start, never at boot. hy3-llamacpp declares
+# Conflicts=ds4-vllm.service, which makes the exclusion mutual automatically.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=45min
+TimeoutStopSec=5min
+ExecStart=%h/ds4-cluster-restart.sh
+ExecStop=%h/ds4-cluster-down.sh
+# ExecStop does not run when ExecStart itself fails; StopPost does, so a
+# failed bringup still tears the cluster down instead of leaving the serve
+# unit and ray daemons running behind a "failed" wrapper. Idempotent.
+ExecStopPost=%h/ds4-cluster-down.sh

@@ -1,0 +1,19 @@
+[Unit]
+Description=Load callback_xd-patched thunderbolt.ko for multi-cable RDMA
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=tbv-roce.service
+Wants=tbv-roce.service
+ConditionPathExists=/var/lib/tbv/thunderbolt-patched.ko
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Matched-pair rule: patched core -> patched net ONLY (stock net over the patched
+# core has mismatched tb_protocol_handler/ring ABI and panics on cable connect).
+# If the patched core fails (e.g. vermagic after a kernel update), fall back to the
+# stock pair so networking still comes up (RDMA degraded but box reachable).
+ExecStart=/usr/bin/bash -c 'if insmod /var/lib/tbv/thunderbolt-patched.ko; then insmod /var/lib/tbv/thunderbolt_net.ko || echo "tbv: patched net FAILED to load — NOT loading stock net over patched core"; else echo "tbv: patched core failed — falling back to STOCK core+net (RDMA off)"; modprobe -i thunderbolt; modprobe -i thunderbolt_net; fi; modprobe typec_thunderbolt 2>/dev/null; modprobe ucsi_acpi 2>/dev/null; true'
+
+[Install]
+WantedBy=multi-user.target
