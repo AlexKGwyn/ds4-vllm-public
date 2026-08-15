@@ -262,9 +262,7 @@ The themes:
   hundred MiB of staging carry a full-length prefill.
 
 **Hard rule carried from this project:** these are performance/serving changes
-with **zero intended quality loss** — quality-gate any further kernel/tuning
-change against golden outputs (fixed-seed temperature-0 prompts plus
-needle/recall probes at your target context depth).
+with **zero intended quality loss**
 
 ---
 
