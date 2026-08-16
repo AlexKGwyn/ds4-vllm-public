@@ -249,10 +249,7 @@ The themes:
 - **Thunderbolt-4 RDMA all-reduce** — custom `tbv_ar` (v1) / `tbv_ar2` (v2)
   all-reduce hooked into vLLM's communicator, replacing NCCL for the TP
   all-reduce on the TB4 link.
-- **Reasoning + tools** — retain prior assistant `reasoning_content` across
-  tool-calling turns (fixes vLLM "forgetting" its own reasoning), and fix the
-  `</think>` boundary so structured-output grammar engages after reasoning.
-- **Disk KV cache** (`DS4_DISK_KV=1`, off by default) — an `fs_lru` secondary
+- **Disk KV cache** an `fs_lru` secondary
   tier gives the KV offloader a byte cap with LRU eviction, which the stock `fs`
   tier has no mechanism for, so it can point at a filesystem shared with
   everything else. Alongside it, the offloading scheduler now bounds each store
@@ -260,9 +257,6 @@ The themes:
   cursor when the tier refuses, so a single refusal ratchets the ask past the
   tier and stores stop for the rest of the request. Bounding it lets a few
   hundred MiB of staging carry a full-length prefill.
-
-**Hard rule carried from this project:** these are performance/serving changes
-with **zero intended quality loss**
 
 ---
 
