@@ -22,8 +22,8 @@ prompts, temperature 0, thinking disabled, 300-token generations.
 |---|---|---|---|
 | 512 | ~300 | 23 | 32 |
 | 10k | ~270 | 23 | 27 |
-| 50k | ~260 | 19 | 27 |
-| 100k | ~235 | 19 | 22 |
+| 50k | ~239 | 19 | 27 |
+| 100k | ~191 | 19 | 22 |
 
 Prefill is content-agnostic (prose and code measured within a few percent).
 A fresh bringup warms its own kernels/caches automatically
