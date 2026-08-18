@@ -108,11 +108,32 @@ if [ "$DS4_DISK_KV" = "1" ]; then
   echo "[manual-serve] disk KV ON: dir=$KVDIR cap=${DS4_DISK_KV_BYTES:-32212254720} cpu=${DS4_DISK_KV_CPU_BYTES:-4294967296}"
 fi
 
+# Decode runs with breakable (PIECEWISE) cudagraphs. Three things make this
+# correct on gfx1151; all three live in the patched engine
+# (container/patches/vllm-upstream.patch):
+#   1. VLLM_USE_BREAKABLE_CUDAGRAPH=1 exported in ds4-cluster-env.sh so the
+#      prestarted Ray workers see it at import time. Without it the
+#      eager-break decorator strips itself in the workers and the capture
+#      silently degrades to one monolithic graph with host-side attention
+#      metadata baked in (deterministic garbage on replay). The patched
+#      decorator also checks at call time as a backstop.
+#   2. Padding-row zeroing after each replayed eager segment: eager ops
+#      write only the valid rows of their in-place outputs, and NaN pool
+#      garbage in the padding rows otherwise poisons the whole batch
+#      through row-mixing fp8-quant reductions in the next graph segment.
+#   3. The TP all-reduce is a functional eager break: tbv_ar2 refuses to
+#      run during stream capture, so capturing it would bake the RCCL
+#      fallback into every replay.
+# The capture sizes cover the MTP-5 decode shapes (6*num_seqs) exactly;
+# padded replays are correct but slower. The speculative config's
+# "enforce_eager":true is LOAD-BEARING and must stay: the DSpark drafter
+# cannot be captured by the runner's wrapper (its replay-marker test is a
+# blocking D2H, illegal during capture) and manages its own step-0 graphs
+# instead (DS4_MTP_CUDAGRAPH, default on).
 exec vllm serve "${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" \
   --served-model-name deepseek-v4-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
-  --enforce-eager \
   --kv-cache-dtype fp8 \
   --gpu-memory-utilization ${DS4_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${DS4_KV_BYTES:-6442450944} \
@@ -122,6 +143,8 @@ exec vllm serve "${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" \
   --tokenizer-mode deepseek_v4 \
   --reasoning-parser deepseek_v4 \
   --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"high"}' \
+  -cc.cudagraph_mode=PIECEWISE \
+  -cc.cudagraph_capture_sizes='[1,2,4,6,8,12,16,18,24,32,48,64]' \
   --override-generation-config '{"temperature":1.0,"top_p":1.0}' \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \

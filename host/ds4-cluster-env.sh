@@ -23,8 +23,13 @@ export PYTHONHASHSEED=0
 # the GC threshold alone fires at ~105 GiB but does not hold the line, because
 # GC can only reclaim blocks
 # that are unused, and fragmented blocks that cannot satisfy incoming requests
-# make the allocator grow anyway. Safe with --enforce-eager (no graph capture).
+# make the allocator grow anyway. Safe with both eager and the breakable
+# PIECEWISE cudagraph capture below.
 export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.85
+# Breakable cudagraph (serve script runs -cc.cudagraph_mode=PIECEWISE): the
+# Ray workers are prestarted, so the config auto-enable on the driver never
+# reaches them; export here so worker imports see it.
+export VLLM_USE_BREAKABLE_CUDAGRAPH=1
 export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}ignore::FutureWarning"
 export NCCL_SOCKET_IFNAME=thunderbolt0
 export GLOO_SOCKET_IFNAME=thunderbolt0
@@ -146,3 +151,29 @@ export DS4_MOE_NW=${DS4_MOE_NW:-2}
 export DS4_MOE_NS=${DS4_MOE_NS:-2}
 export DS4_MOE_BK=${DS4_MOE_BK:-256}
 export DS4_MOE_WPE=${DS4_MOE_WPE:-1}
+
+# --- decode kernel dispatch / fusion ----------------------------------------
+# Single-kernel tiny-batch MoE routing (site-packages/ds4_tiny_routing.py,
+# hooked from gpt_oss_triton_kernels_moe): replaces the 5-launch bitmatrix
+# routing pipeline for decode batches; bit-exact, falls back to stock for
+# large (prefill) shapes or when the module is missing. Set 0 to disable.
+export DS4_TINY_ROUTING=${DS4_TINY_ROUTING:-1}
+# Per-callsite cached Triton launcher (site-packages/ds4_fast_triton.py,
+# hooked from vllm/__init__.py): caches binder/specialization work per
+# (kernel, shape/dtype/align key); exactly-launch-equivalent, defers to the
+# stock path for warmup, hooks and unknown argument types. Set 0 to disable.
+export DS4_FAST_TRITON=${DS4_FAST_TRITON:-1}
+# DSpark MTP fast replay (llm_base_proposer): replay iterations of the stash
+# drafter skip the dead attn-metadata rebuild and slot/position updates the
+# drafter provably never reads. Default-on in the patch; exported for
+# visibility. 0 restores the stock loop.
+export DS4_MTP_FAST_REPLAY=${DS4_MTP_FAST_REPLAY:-1}
+# Pin the hipblaslt algo for the attn_o wo_b decode GEMM (bf16 TN
+# 4096 x n x 4096): the heuristic pick is session-dependent and sometimes
+# lands on a much slower algo. The tuned results ship in the image
+# (site-packages/ds4-tunableop0.csv; torch appends the device ordinal to
+# FILENAME). Tuning stays off -- the CSV is read-only, and shapes absent
+# from it keep the stock heuristic.
+export PYTORCH_TUNABLEOP_ENABLED=${PYTORCH_TUNABLEOP_ENABLED:-1}
+export PYTORCH_TUNABLEOP_TUNING=${PYTORCH_TUNABLEOP_TUNING:-0}
+export PYTORCH_TUNABLEOP_FILENAME=${PYTORCH_TUNABLEOP_FILENAME:-/opt/venv/lib/python3.12/site-packages/ds4-tunableop.csv}
