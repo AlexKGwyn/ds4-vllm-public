@@ -267,3 +267,6 @@ The themes:
   incidental OS packages under `/usr/lib/python3.14`; neither affects serving and
   both are intentionally omitted. Re-add `py-spy` with `pip install py-spy` inside
   the container if you want it.
+
+## Special Thanks
+@Jawnnypoo for helping get the initial version of this repository running.
