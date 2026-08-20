@@ -50,7 +50,7 @@ RUN cmake \
         -B /tmp/rocm-build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=ON && \
-    cmake --build /tmp/rocm-build --parallel 16
+    cmake --build /tmp/rocm-build --parallel "$(nproc)"
 
 # Build the usb4_rdma libibverbs provider from source: rdma-core at the ABI
 # the base ships (rdmav57) plus the provider patches from the upstream
