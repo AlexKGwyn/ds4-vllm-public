@@ -66,6 +66,14 @@ keeps it correct:
 Any change to the indexer, MTP, kernels, or tuning knobs must re-pass
 needle/recall probes at your target context depth before it ships (see §5).
 
+Kernel/fusion changes must also pass `host/ds4-kernel-harness.py` (bit-exact
+fused-vs-stock comparison with crash-shaped + stress inputs, run inside the
+container with `HIP_LAUNCH_BLOCKING=1`). Trap: Triton 3.7.0 / ROCm 7.14
+miscompiles runtime-trip-count `scf.for` loops (garbage loads/stores, sporadic
+illegal memory accesses — the 2026-08-19 `_topk_ragged_decode_kernel` fault);
+use `tl.static_range` + masked inactive iterations in single-program kernels.
+See the fixed kernel in `ds4_fused_glue.py`.
+
 ---
 
 ## 1. tbv — Thunderbolt RDMA (do this first)
