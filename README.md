@@ -11,8 +11,7 @@ PRs are welcome for performance improvements.
 
 ## Performance
 
-Single-stream, TP=2 across the two boxes over Thunderbolt RDMA, with the
-**DFlash parallel drafter** (DSpark MTP speculative decoding) enabled. Decode
+Single-stream, TP=2 across the two boxes over Thunderbolt RDMA, with the (DSpark MTP speculative decoding) enabled. Decode
 speed depends on how often the drafter's parallel tokens are accepted, so
 prose and code generate at different rates. Measured on the reference rig
 (2× Ryzen AI Max+ 395 / Radeon 8060S, 128 GB UMA each): fresh uncached
