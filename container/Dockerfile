@@ -4,7 +4,7 @@
 # TheRock/ROCm gfx1151 base image — the exact base the patches were developed
 # against. The base already contains the full ROCm 7 + PyTorch + vLLM build
 # (vLLM commit 470229c); this file applies the DeepSeek-V4 / DSpark patch
-# (patches/vllm-upstream.patch, 31 files), overlays the 12 new files from
+# (patches/vllm-upstream.patch, 35 files), overlays the 16 new files from
 # ./rootfs, builds the usb4_rdma provider from source (rdma-core + the
 # upstream thunderbolt-ibverbs patches), compiles the TB4-RDMA all-reduce
 # natives, and rebuilds ROCr. Third-party sources are FETCHED at pinned
@@ -50,7 +50,7 @@ RUN cmake \
         -B /tmp/rocm-build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=ON && \
-    cmake --build /tmp/rocm-build --parallel 16
+    cmake --build /tmp/rocm-build --parallel "$(nproc)"
 
 # Build the usb4_rdma libibverbs provider from source: rdma-core at the ABI
 # the base ships (rdmav57) plus the provider patches from the upstream
@@ -69,8 +69,8 @@ RUN git clone --depth 1 -b v57.0 https://github.com/linux-rdma/rdma-core /tmp/rd
 
 FROM ${DS4_BASE}
 
-# Apply the vLLM patch-set to the base's own sources (31 files), then overlay
-# the 12 new files from rootfs/ (which mirrors "/"). The patch is the same
+# Apply the vLLM patch-set to the base's own sources (35 files), then overlay
+# the 16 new files from rootfs/ (which mirrors "/"). The patch is the same
 # reviewable diff in patches/; container/verify-patches.sh proves it applies.
 COPY container/patches/vllm-upstream.patch /tmp/
 RUN cd / && git apply -p1 --whitespace=nowarn /tmp/vllm-upstream.patch && rm /tmp/vllm-upstream.patch

@@ -123,7 +123,7 @@
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
 --- a/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/amd/rocm.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/amd/rocm.py
-@@ -30,6 +30,12 @@
+@@ -30,6 +30,22 @@
  )
  from vllm.v1.worker.workspace import current_workspace_manager
  
@@ -133,10 +133,41 @@
 +# __getitem__ -> decodevalue each time.
 +_DS4_DBG_NEEDLE = __import__("os").environ.get("DS4_DBG_NEEDLE")
 +
++# DS4_FUSE_RAGGED=1 (default): fused single-kernel decode topk ragged build
++# (see compute_global_topk_ragged_indices_and_indptr). Holds the module, or
++# None when disabled/unavailable.
++_DS4_FUSE_RAGGED = None
++if __import__("os").environ.get("DS4_FUSE_RAGGED", "1") != "0":
++    try:
++        import ds4_fused_glue as _DS4_FUSE_RAGGED
++    except Exception:
++        _DS4_FUSE_RAGGED = None
++
  
  def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
      lengths = lengths.to(dtype=torch.int32).contiguous()
-@@ -713,6 +719,43 @@
+@@ -238,6 +254,20 @@
+     num_tokens = topk_indices.shape[0]
+     topk = topk_indices.shape[1]
+ 
++    # DS4_FUSE_RAGGED=1 (default): at decode batch sizes the 4-launch chain
++    # below (lens kernel + zeros + cumsum + pack kernel) runs as ONE
++    # single-program triton kernel (ds4_fused_glue.topk_ragged_decode).
++    # Integer-only arithmetic, identical packing order -> bit-exact; =0 or a
++    # large batch restores the stock chain.
++    if _DS4_FUSE_RAGGED is not None and num_tokens <= 64:
++        return _DS4_FUSE_RAGGED.topk_ragged_decode(
++            topk_indices,
++            token_to_req_indices,
++            block_table,
++            block_size,
++            is_valid_token,
++        )
++
+     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+     _compute_topk_lens_kernel[(num_tokens,)](
+         topk_lens,
+@@ -713,6 +743,43 @@
                  topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                  topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
  
@@ -657,7 +688,7 @@
  import importlib
  import math
  from importlib.util import find_spec
-@@ -18,6 +19,12 @@
+@@ -18,6 +19,16 @@
  from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
  from vllm.v1.worker.workspace import current_workspace_manager
  
@@ -666,11 +697,15 @@
 +# the process lives, and os._Environ.get routes through Mapping.get ->
 +# __getitem__ -> decodevalue each time.
 +_DS4_DBG_NEEDLE = __import__("os").environ.get("DS4_DBG_NEEDLE")
++# DS4_FUSE_ATTN_OUT=1 (default): rocm_sparse_attn_decode's reduce kernel
++# writes the caller's output buffer directly instead of a fresh tensor that
++# is then copy_()'d over (one copy per layer). Bit-exact: identical stores.
++_DS4_FUSE_ATTN_OUT = os.environ.get("DS4_FUSE_ATTN_OUT", "1") != "0"
 +
  if current_platform.is_rocm():
      from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
  else:
-@@ -129,7 +136,7 @@
+@@ -129,7 +140,7 @@
      )
  
  
@@ -679,7 +714,7 @@
  def _cp_gather_indexer_quant_cache_kernel(
      kv_cache_ptr,  # [n_blks,blk_size//tile_blk,head_dim//16B,tile_blk,16B]
      # [n_blks, blk_size, head_dim]
-@@ -147,7 +154,7 @@
+@@ -147,7 +158,7 @@
      HEAD_DIM: tl.constexpr,
      BLOCK_TILE_SIZE: tl.constexpr,
      HEAD_TILE_SIZE: tl.constexpr,
@@ -688,7 +723,7 @@
      NUM_BATCHES: tl.constexpr,
      BLOCK_TABLE_WIDTH: tl.constexpr,
      NUM_BLOCKS: tl.constexpr,
-@@ -219,6 +226,7 @@
+@@ -219,6 +230,7 @@
      token_to_seq: torch.Tensor,
      block_tile_size: int = 16,
      head_tile_size: int = 16,
@@ -696,7 +731,7 @@
  ):
      num_tokens = k_fp8.size(0)
      block_size = k_cache.size(1)
-@@ -232,7 +240,12 @@
+@@ -232,7 +244,12 @@
      k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
      grid = (num_tokens,)
      k_fp8_scale = k_fp8_scale.view(torch.float32)
@@ -710,7 +745,7 @@
      _cp_gather_indexer_quant_cache_kernel[grid](
          k_cache_value,
          k_cache_scale,
-@@ -265,6 +278,12 @@
+@@ -265,6 +282,12 @@
      block_tables: torch.Tensor,
      max_model_len: int,
  ):
@@ -723,7 +758,7 @@
      from vllm.utils.math_utils import cdiv
  
      fp8_dtype = current_platform.fp8_dtype()
-@@ -490,6 +509,10 @@
+@@ -490,6 +513,10 @@
      Returns:
          Logits tensor of shape [M, N], dtype `torch.float32`.
      """
@@ -734,7 +769,7 @@
      k_fp8, scale = kv
      seq_len_kv = k_fp8.shape[0]
      k = k_fp8.to(torch.bfloat16)
-@@ -504,7 +527,7 @@
+@@ -504,7 +531,7 @@
      )
      mask = mask_lo & mask_hi
  
@@ -743,7 +778,7 @@
      logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
      logits = logits.masked_fill(~mask, float("-inf"))
  
-@@ -575,8 +598,14 @@
+@@ -575,8 +602,14 @@
      row_starts: torch.Tensor | None = None,
  ) -> torch.Tensor:
      k = min(topk_tokens, logits.shape[-1])
@@ -760,7 +795,7 @@
      indices = torch.where(
          values == float("-inf"),
          torch.full_like(indices, -1, dtype=torch.int32),
-@@ -600,6 +629,59 @@
+@@ -600,6 +633,59 @@
      return padded
  
  
@@ -820,7 +855,7 @@
  def rocm_aiter_sparse_attn_indexer_fake(
      hidden_states: torch.Tensor,
      k_cache_prefix: LayerNameType,
-@@ -762,6 +844,7 @@
+@@ -762,6 +848,7 @@
                      chunk.block_table,
                      chunk.cu_seq_lens,
                      token_to_seq=chunk.token_to_seq,
@@ -828,7 +863,7 @@
                  )
              logits = rocm_fp8_mqa_logits(
                  q_fp8[chunk.token_start : chunk.token_end],
-@@ -774,17 +857,12 @@
+@@ -774,17 +861,12 @@
                  chunk.token_start : chunk.token_end, :topk_tokens
              ]
  
@@ -850,7 +885,7 @@
              )
  
      if has_decode:
-@@ -823,18 +901,23 @@
+@@ -823,18 +905,23 @@
          )
  
          topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
@@ -885,7 +920,7 @@
  
          if decode_metadata.requires_padding:
              # if padded, we need to unpack
-@@ -1271,6 +1354,7 @@
+@@ -1271,6 +1358,7 @@
      IS_FNUZ: tl.constexpr,
      BLOCK_H: tl.constexpr,
      BLOCK_K: tl.constexpr,
@@ -893,7 +928,7 @@
  ):
      query_idx = tl.program_id(0)
      pid_h = tl.program_id(1)
-@@ -1317,36 +1401,43 @@
+@@ -1317,36 +1405,43 @@
          block_idx = safe_slot // main_block_size
          pos_in_block = safe_slot % main_block_size
          cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
@@ -966,7 +1001,7 @@
  
          scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
          scores *= scale
-@@ -1383,38 +1474,45 @@
+@@ -1383,38 +1478,45 @@
              cache_block_ptr = (
                  extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
              )
@@ -1042,7 +1077,7 @@
  
              scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
                  q_rope,
-@@ -1509,6 +1607,7 @@
+@@ -1509,6 +1611,7 @@
      BLOCK_K: tl.constexpr,
      NUM_SPLITS: tl.constexpr,
      NUM_STAGES: tl.constexpr,
@@ -1050,7 +1085,7 @@
  ):
      query_idx = tl.program_id(0)
      split_id = tl.program_id(1)
-@@ -1562,36 +1661,43 @@
+@@ -1562,36 +1665,43 @@
          block_idx = safe_slot // main_block_size
          pos_in_block = safe_slot % main_block_size
          cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
@@ -1123,7 +1158,7 @@
  
          scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
          scores *= scale
-@@ -1631,38 +1737,45 @@
+@@ -1631,38 +1741,45 @@
              cache_block_ptr = (
                  extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
              )
@@ -1199,7 +1234,31 @@
  
              scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
                  q_rope,
-@@ -2117,6 +2230,7 @@
+@@ -2018,6 +2135,7 @@
+     extra_cache: torch.Tensor | None = None,
+     extra_indices: torch.Tensor | None = None,
+     extra_indptr: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
+     assert main_cache.ndim == 3, (
+@@ -2079,7 +2197,14 @@
+         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
+ 
+     block_h = 16
+-    out = torch.empty_like(q, dtype=torch.bfloat16)
++    if out is None:
++        out = torch.empty_like(q, dtype=torch.bfloat16)
++    else:
++        # DS4_FUSE_ATTN_OUT: the reduce kernel writes the caller's output
++        # buffer directly (same stores, different address -> bit-exact),
++        # dropping the per-layer [b,h,d] copy in rocm_sparse_attn_decode.
++        assert out.shape == q.shape and out.dtype == torch.bfloat16
++        assert out.stride(-1) == 1
+     heads_blocks = triton.cdiv(num_heads, block_h)
+     nope_block = triton.next_power_of_2(nope_head_dim)
+     comb_dim = nope_head_dim + rope_head_dim
+@@ -2117,6 +2242,7 @@
              IS_FNUZ=is_fnuz,
              BLOCK_H=block_h,
              BLOCK_K=block_k,
@@ -1207,7 +1266,7 @@
              num_warps=8,
          )
          return out
-@@ -2177,6 +2291,7 @@
+@@ -2177,6 +2303,7 @@
          BLOCK_K=block_k,
          NUM_SPLITS=num_splits,
          NUM_STAGES=1,
@@ -1215,7 +1274,23 @@
          num_warps=4,
      )
  
-@@ -2327,7 +2442,7 @@
+@@ -2220,6 +2347,7 @@
+     main_ragged_indptr: torch.Tensor | None = None,
+     extra_ragged_indices: torch.Tensor | None = None,
+     extra_ragged_indptr: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     if main_ragged_indices is None or main_ragged_indptr is None:
+         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
+@@ -2255,6 +2383,7 @@
+         extra_cache=extra_cache,
+         extra_indices=extra_ragged_indices,
+         extra_indptr=extra_ragged_indptr,
++        out=out,
+     )
+ 
+ 
+@@ -2327,7 +2456,7 @@
      rope_head_dim: int,
      output: torch.Tensor,
  ) -> None:
@@ -1224,7 +1299,7 @@
          "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
          f"got {swa_k_cache.dtype}"
      )
-@@ -2347,7 +2462,7 @@
+@@ -2347,7 +2476,7 @@
          assert topk_indices is not None or (
              topk_ragged_indices is not None and topk_ragged_indptr is not None
          )
@@ -1233,6 +1308,31 @@
              "ROCm Triton sparse decode expects uint8 fp8_ds_mla extra cache, "
              f"got {kv_cache.dtype}"
          )
+@@ -2355,6 +2484,15 @@
+         if topk_indices is not None:
+             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
+ 
++    # DS4_FUSE_ATTN_OUT=1 (default): let the decode reduce kernel write the
++    # caller's output buffer directly (same kernel, same stores -> bit-exact),
++    # removing the per-layer [b,h,d] copy_ below. =0 restores the copy path.
++    fused_out = (
++        _DS4_FUSE_ATTN_OUT
++        and output.dtype == torch.bfloat16
++        and output.shape == q.shape
++        and output.stride(-1) == 1
++    )
+     attn_out = _rocm_sparse_attn_decode_triton(
+         q=q,
+         main_cache=swa_k_cache,
+@@ -2371,5 +2509,7 @@
+         main_ragged_indptr=swa_ragged_indptr,
+         extra_ragged_indices=topk_ragged_indices,
+         extra_ragged_indptr=topk_ragged_indptr,
++        out=output if fused_out else None,
+     )
+-    output.copy_(attn_out.to(output.dtype))
++    if not fused_out:
++        output.copy_(attn_out.to(output.dtype))
 --- a/opt/venv/lib/python3.12/site-packages/vllm/third_party/triton_kernels/matmul_ogs_details/opt_flags.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/third_party/triton_kernels/matmul_ogs_details/opt_flags.py
 @@ -1,11 +1,54 @@
@@ -1544,6 +1644,122 @@
      from vllm.model_executor.layers.quantization.utils.fp8_utils import (
          w8a8_triton_block_scaled_mm,
      )
+--- a/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
+@@ -232,6 +232,17 @@
+ # whether `SparseMatrix` is importable.
+ use_legacy_triton_kernels = False
+ 
++# DS4: latched at import (matches every other DS4_* flag; must agree on both
++# TP ranks via the cluster env files).
++import os as _ds4_os
++_DS4_TINY_ROUTING = _ds4_os.environ.get("DS4_TINY_ROUTING") == "1"
++if _DS4_TINY_ROUTING:
++    try:
++        from ds4_tiny_routing import make_routing_data_tiny, tiny_routing_supported
++    except Exception:  # missing module -> fall back to stock path
++        _DS4_TINY_ROUTING = False
++
++
+ if has_triton_kernels():
+     try:
+         import triton_kernels.swiglu
+@@ -508,6 +519,14 @@
+     topk_weights: torch.Tensor,
+     num_local_experts: int,
+ ) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
++    # DS4 gfx1151: single-kernel routing for tiny decode batches. Replaces the
++    # 5-launch bitmatrix/sort pipeline with one triton launch; eager decode is
++    # Python-launch-bound, so the launch-count cut is a direct step-time win.
++    # Bit-exact vs the stock path.
++    if _DS4_TINY_ROUTING:
++        n_r, n_a = topk_ids.shape
++        if tiny_routing_supported(n_r, n_a, num_local_experts):
++            return make_routing_data_tiny(topk_ids, topk_weights, num_local_experts)
+     topk_ids = topk_ids.to(torch.int16)
+     topk_weights = topk_weights.to(torch.bfloat16)
+ 
+--- a/opt/venv/lib/python3.12/site-packages/vllm/__init__.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/__init__.py
+@@ -13,6 +13,18 @@
+ # other modules are imported.
+ import vllm.env_override  # noqa: F401
+ 
++# DS4: env-gated per-callsite cached Triton launcher (site-packages/
++# ds4_fast_triton.py). The module is a no-op unless DS4_FAST_TRITON=1; the
++# guard here just avoids paying its import when disabled or absent.
++import os as _ds4_os
++
++if _ds4_os.environ.get("DS4_FAST_TRITON", "0") == "1":
++    try:
++        import ds4_fast_triton  # noqa: F401
++    except Exception:  # pragma: no cover - missing module/triton: run stock
++        pass
++del _ds4_os
++
+ MODULE_ATTRS = {
+     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
+     "EngineArgs": ".engine.arg_utils:EngineArgs",
+--- a/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/activation.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/activation.py
+@@ -3,11 +3,14 @@
+ """Custom activation functions."""
+ 
+ import math
++import os as _ds4_os
+ 
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
++_ds4_env = _ds4_os.environ
++
+ from vllm.distributed import (
+     divide,
+     get_tensor_model_parallel_rank,
+@@ -166,16 +169,42 @@
+         return: (num_tokens, d) or (batch_size, seq_len, d)
+     """
+ 
++    # DS4_FUSE_SILU=1 (default): on ROCm the clamp/clamp/silu/mul aten chain
++    # (4 kernels; with compilation NONE under VLLM_USE_BREAKABLE_CUDAGRAPH the
++    # CustomOp native path never gets inductor-fused) runs as ONE triton
++    # kernel from ds4_fused_glue. Bit-exact vs forward_native (incl. NaN
++    # propagation and the per-op rounding points). =0 (or import failure, or
++    # a non-2D/non-bf16/non-contiguous input) restores the aten chain.
++    _ds4_fused_glue = None
++
+     def __init__(self, swiglu_limit: float, *, compile_native: bool = True):
+         super().__init__(compile_native=compile_native)
+         self.swiglu_limit = float(swiglu_limit)
+         if current_platform.is_rocm() or current_platform.is_xpu():
+             self._forward_method = self.forward_native
++            if current_platform.is_rocm() and _ds4_env.get(
++                "DS4_FUSE_SILU", "1"
++            ) != "0":
++                try:
++                    import ds4_fused_glue
++
++                    SiluAndMulWithClamp._ds4_fused_glue = ds4_fused_glue
++                    self._forward_method = self.forward_ds4_fused
++                except Exception:
++                    pass
+         elif current_platform.is_cuda_alike():
+             self.op = torch.ops._C.silu_and_mul_with_clamp
+         elif current_platform.is_cpu():
+             self._forward_method = self.forward_native
+ 
++    def forward_ds4_fused(self, x: torch.Tensor) -> torch.Tensor:
++        out = SiluAndMulWithClamp._ds4_fused_glue.silu_mul_clamp(
++            x, self.swiglu_limit
++        )
++        if out is None:  # ineligible input shape/dtype: stock chain
++            return self.forward_native(x)
++        return out
++
+     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+         d = x.shape[-1] // 2
+         gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
 --- a/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
 @@ -252,6 +252,57 @@
@@ -1604,6 +1820,45 @@
          # since currently we perform copy input -> symm_input -> out-of-place AR
          # return symm_output, we don't need to check if input is symmetric
          if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
+--- a/opt/venv/lib/python3.12/site-packages/vllm/distributed/communication_op.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/distributed/communication_op.py
+@@ -9,11 +9,34 @@
+ from .parallel_state import get_tp_group
+ 
+ 
+-def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+-    """All-reduce the input tensor across model parallel group."""
++def _tp_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+     return get_tp_group().all_reduce(input_)
+ 
+ 
++_tp_all_reduce_breakable = None
++
++
++def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
++    """All-reduce the input tensor across model parallel group.
++
++    Routed through a breakable-cudagraph functional eager break: fast
++    all-reduce paths (tbv_ar2) refuse to run during stream capture,
++    so capturing this op would bake the slow RCCL fallback into every graph
++    replay. The break keeps the collective on the eager fast path at replay.
++    The import is lazy to avoid a circular import at package init.
++    """
++    global _tp_all_reduce_breakable
++    if _tp_all_reduce_breakable is None:
++        from vllm.compilation.breakable_cudagraph import (
++            eager_break_functional_during_capture,
++        )
++
++        _tp_all_reduce_breakable = eager_break_functional_during_capture(
++            _tp_all_reduce
++        )
++    return _tp_all_reduce_breakable(input_)
++
++
+ def tensor_model_parallel_all_gather(
+     input_: torch.Tensor, dim: int = -1
+ ) -> torch.Tensor:
 --- a/opt/venv/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py
 @@ -1143,6 +1143,24 @@
@@ -1776,7 +2031,160 @@
                  kv_cache_tensor.size, dtype=torch.int8, device=self.device
 --- a/opt/venv/lib/python3.12/site-packages/vllm/compilation/breakable_cudagraph.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/compilation/breakable_cudagraph.py
-@@ -210,8 +210,24 @@
+@@ -56,6 +56,53 @@
+ F = TypeVar("F", bound=Callable[..., Any])
+ 
+ 
++def _num_valid_tokens() -> int | None:
++    """Unpadded token count of the current forward, or None."""
++    try:
++        if not is_forward_context_available():
++            return None
++        md = get_forward_context().attn_metadata
++        if isinstance(md, list):
++            md = md[0]
++        if isinstance(md, dict):
++            if not md:
++                return None
++            md = next(iter(md.values()))
++        nv = getattr(md, "num_actual_tokens", None)
++        if nv is None:
++            ndt = getattr(md, "num_decode_tokens", None)
++            npt = getattr(md, "num_prefill_tokens", None)
++            if ndt is not None and npt is not None:
++                nv = int(ndt) + int(npt)
++        return int(nv) if nv is not None else None
++    except Exception:
++        return None
++
++
++def _zero_padding_rows(args: tuple, kwargs: dict, num_padded: int) -> None:
++    """Zero rows [num_valid:] of every float tensor shaped (num_padded, ...).
++
++    Eager-break ops write only the valid rows of their in-place outputs at
++    replay time; the padding rows keep whatever the cudagraph pool last held
++    there, which can be NaN/Inf. A later captured segment's row-mixing
++    reductions (e.g. dynamic-quant amax over the whole activation) then
++    poison every row of the batch. Padding rows are dead weight, so zeroing
++    them is always safe. No-op when the batch is unpadded (incl. capture,
++    where the dummy batch always fills the descriptor).
++    """
++    nv = _num_valid_tokens()
++    if nv is None or nv >= num_padded:
++        return
++    for t in list(args) + list(kwargs.values()):
++        if (
++            isinstance(t, torch.Tensor)
++            and t.is_floating_point()
++            and t.dim() >= 1
++            and t.shape[0] == num_padded
++        ):
++            t[nv:].zero_()
++
++
+ def eager_break_during_capture(fn: F) -> F:
+     """Decorator that turns a custom-op Python kernel into a "break point"
+     for the breakable cudagraph capture.
+@@ -87,8 +134,16 @@
+         def unified_attention_with_output(...):
+             ...
+     """
+-    if not is_breakable_cudagraph_enabled():
+-        return fn
++    # NOTE: do NOT gate on is_breakable_cudagraph_enabled() at decoration
++    # (import) time. Under the Ray executor the worker processes are
++    # prestarted before VllmConfig's auto-enable exports
++    # VLLM_USE_BREAKABLE_CUDAGRAPH, so an import-time check strips the
++    # decorator in the workers and the "piecewise" capture silently degrades
++    # to one monolithic graph with attention/indexer host state baked in
++    # (deterministic prompt-independent garbage on replay, even though the
++    # capture itself completes). The BreakableCUDAGraphCapture.current()
++    # check below is the real gate: outside a breakable capture this
++    # wrapper is a passthrough.
+ 
+     @functools.wraps(fn)
+     def wrapper(*args: Any, **kwargs: Any) -> Any:
+@@ -112,7 +167,78 @@
+             k: weak_ref_tensor(v) if isinstance(v, torch.Tensor) else v
+             for k, v in kwargs.items()
+         }
+-        return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
++        num_padded = None
++        if is_forward_context_available():
++            bd = get_forward_context().batch_descriptor
++            if bd is not None:
++                num_padded = bd.num_tokens
++
++        def _replay_fn():
++            r = fn(*weak_args, **weak_kwargs)
++            if num_padded is not None:
++                _zero_padding_rows(weak_args, weak_kwargs, num_padded)
++            return r
++
++        return capture.add_eager(_replay_fn)
++
++    return wrapper  # type: ignore[return-value]
++
++
++def eager_break_functional_during_capture(fn: F) -> F:
++    """Eager break for FUNCTIONAL (out-of-place) ops, e.g. all-reduce.
++
++    Unlike :func:`eager_break_during_capture`, the wrapped op may return a
++    fresh tensor. At capture time the op runs eagerly (capture suspended, so
++    capture-refusing fast paths like tbv_ar2 are usable) and its returned
++    tensor is pinned as the static output whose address downstream graph
++    segments bake. On replay the op runs eagerly again and the fresh result
++    is copied into the pinned tensor.
++
++    Motivation: collectives such as tbv_ar2 refuse to run during stream
++    capture (torch.cuda.is_current_stream_capturing gate), so capturing them
++    bakes the slow capture-safe RCCL fallback into every replay. Breaking
++    them out keeps the fast eager path.
++    """
++
++    @functools.wraps(fn)
++    def wrapper(*args: Any, **kwargs: Any) -> Any:
++        capture = BreakableCUDAGraphCapture.current()
++        if capture is None or not capture._capturing:
++            return fn(*args, **kwargs)
++        if is_forward_context_available():
++            mode = get_forward_context().cudagraph_runtime_mode
++            if mode == CUDAGraphMode.FULL:
++                return fn(*args, **kwargs)
++
++        weak_args = tuple(
++            weak_ref_tensor(a) if isinstance(a, torch.Tensor) else a for a in args
++        )
++        weak_kwargs = {
++            k: weak_ref_tensor(v) if isinstance(v, torch.Tensor) else v
++            for k, v in kwargs.items()
++        }
++        num_padded = None
++        if is_forward_context_available():
++            bd = get_forward_context().batch_descriptor
++            if bd is not None:
++                num_padded = bd.num_tokens
++        holder: dict[str, torch.Tensor] = {}
++
++        def _run_and_copy():
++            r = fn(*weak_args, **weak_kwargs)
++            out = holder.get("out")
++            if out is None:
++                # Capture-time invocation: pin the result as the static
++                # output (allocated on the normal heap while capture is
++                # suspended, so the address is stable).
++                holder["out"] = r
++                return r
++            out.copy_(r)
++            if num_padded is not None:
++                _zero_padding_rows((out,), {}, num_padded)
++            return out
++
++        return capture.add_eager(_run_and_copy)
+ 
+     return wrapper  # type: ignore[return-value]
+ 
+@@ -210,8 +336,24 @@
      # --- replay ----------------------------------------------------------
  
      def replay(self) -> None:
@@ -1805,7 +2213,21 @@
  
 --- a/opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/llm_base_proposer.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/llm_base_proposer.py
-@@ -91,7 +91,13 @@
+@@ -55,6 +55,13 @@
+ 
+ logger = init_logger(__name__)
+ 
++# DS4: skip dead per-iteration work for stash-style drafters (DSpark MTP).
++# Bit-exact by construction (see the fast_replay comment in propose());
++# DS4_MTP_FAST_REPLAY=0 restores the stock loop.
++import os as _ds4_os  # noqa: E402
++
++_DS4_MTP_FAST_REPLAY = _ds4_os.environ.get("DS4_MTP_FAST_REPLAY", "1") == "1"
++
+ 
+ class SpecDecodeBaseProposer:
+     def __init__(
+@@ -91,7 +98,13 @@
          if hasattr(draft_hf_config, "compress_ratios") and hasattr(
              draft_hf_config, "hc_mult"
          ):
@@ -1820,7 +2242,7 @@
  
          # Unifying eagle, draft model, and parallel drafting support.
          # DFlash always uses parallel drafting (all tokens in one pass),
-@@ -432,6 +438,24 @@
+@@ -432,6 +445,24 @@
      def take_last_draft_probs(self) -> torch.Tensor | None:
          return self._last_draft_probs
  
@@ -1845,7 +2267,69 @@
      def propose(
          self,
          # [num_tokens]
-@@ -630,6 +654,12 @@
+@@ -585,13 +616,32 @@
+ 
+         block_size = self.block_size
+         assert block_size > 0, "block_size has not been initialized."
++        # DS4 fast replay (DS4_MTP_FAST_REPLAY, default on): the DSpark stash
++        # drafter runs the WHOLE block draft in the first pass and its replay
++        # iterations (spec_step_idx >= 1) return immediately without reading
++        # input_ids, positions, hidden_states values, slot mappings or
++        # attention metadata; compute_logits then replays stashed columns.
++        # For that drafter the per-iteration attention-metadata rebuild (the
++        # sparse-SWA builder does several blocking ``.item()`` D2H syncs per
++        # build), the position/slot-mapping update kernels and the input
++        # buffer copies are pure dead weight in the decode tail, so skip
++        # them. Requires the drafter to advertise the contract via
++        # ``dspark_replay_ignores_inputs`` AND the proposer to actually pass
++        # spec_step_idx (signature-gated), so every other drafter keeps the
++        # stock path bit-for-bit.
++        fast_replay = (
++            _DS4_MTP_FAST_REPLAY
++            and self._model_takes_spec_step_idx
++            and getattr(self.model, "dspark_replay_ignores_inputs", False)
++        )
+         for token_index in range(self.num_speculative_tokens - 1):
+             # Update the inputs.
+             # cast to int32 is crucial when eagle model is compiled.
+             # tensor.argmax() returns int64 by default.
+-            input_ids = draft_token_ids_list[-1].int()
++            if not fast_replay:
++                input_ids = draft_token_ids_list[-1].int()
+ 
+-            if not self.constant_draft_positions:
++            if not (self.constant_draft_positions or fast_replay):
+                 positions = self._update_positions_dependent_metadata(
+                     positions,
+                     common_attn_metadata,
+@@ -603,7 +653,9 @@
+             # Rebuild attention metadata. When draft positions are constant
+             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
+             # loop iterations so we build once and reuse.
+-            if not self.constant_draft_positions or token_index == 0:
++            if not fast_replay and (
++                not self.constant_draft_positions or token_index == 0
++            ):
+                 _, per_layer_attn_metadata = (
+                     self.build_per_group_and_layer_attn_metadata(
+                         common_attn_metadata, draft_index=token_index + 1
+@@ -611,8 +663,13 @@
+                 )
+ 
+             # copy inputs to buffer for cudagraph
+-            self.input_ids[:batch_size] = input_ids
+-            self.hidden_states[:batch_size] = hidden_states
++            if not fast_replay:
++                self.input_ids[:batch_size] = input_ids
++                self.hidden_states[:batch_size] = hidden_states
++            elif token_index == 0:
++                # Seed the hidden buffer once: replay model calls return
++                # (and later iterations re-copy) this exact buffer slice.
++                self.hidden_states[:batch_size] = hidden_states
+             if self.supports_mm_inputs:
+                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
+ 
+@@ -630,6 +687,12 @@
              }
              if self.pass_hidden_states_to_model:
                  model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
@@ -1858,7 +2342,7 @@
  
              with set_forward_context(
                  per_layer_attn_metadata,
-@@ -1551,6 +1581,11 @@
+@@ -1551,6 +1614,11 @@
          for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
              for layer_name in kv_cache_group.layer_names:
                  kv_cache_groups[layer_name] = id

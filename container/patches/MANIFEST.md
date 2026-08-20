@@ -3,11 +3,11 @@
 All changes are a single overlay on the **`kyuz0/vllm-therock-gfx1151`** base
 (pinned digest `sha256:25fd294f…`, which ships vLLM commit **`470229c`**).
 
-- **31 modified** files — shipped as `vllm-upstream.patch` in this folder, applied to the base's own sources at image build
+- **35 modified** files — shipped as `vllm-upstream.patch` in this folder, applied to the base's own sources at image build
   (`*.patch`, base → patched). The Dockerfile does **not** apply these; it
   `COPY`s the final files from `../rootfs`. The diffs are here for review so a
   reader can see exactly what changed versus upstream.
-- **12 new** files — added by the patch set; no diff (whole file is new). Their
+- **16 new** files — added by the patch set; no diff (whole file is new). Their
   final form is in `../rootfs`.
 - 1 file (`aiter_meta/csrc/cpp_itfs/utils.py`) was flagged changed by the image
   layer but is **byte-identical** to the base (metadata-only touch) and is
@@ -22,8 +22,8 @@ modules and the aiter config).
 |---|---|---|
 | `vllm/models/deepseek_v4/__init__.py` | +1/-1 | model registration |
 | `vllm/models/deepseek_v4/amd/model.py` | +67/-1 | AMD DSpark model wiring (custom all-reduce hook, layer glue) |
-| `vllm/models/deepseek_v4/amd/rocm.py` | +43 | ROCm-specific op paths |
-| `vllm/models/deepseek_v4/amd/dspark_mtp.py` | **new (885)** | DSpark Multi-Token-Prediction (MTP) drafter |
+| `vllm/models/deepseek_v4/amd/rocm.py` | +67 | ROCm-specific op paths; `DS4_FUSE_RAGGED` single-kernel decode topk ragged build |
+| `vllm/models/deepseek_v4/amd/dspark_mtp.py` | **new (1384)** | DSpark Multi-Token-Prediction (MTP) drafter: fast-replay contract, self-managed step-0 draft CUDA graphs (`DS4_MTP_CUDAGRAPH`), fused in-graph glue (`DS4_MTP_FUSE_GLUE`), vocab-sharded markov chain + distributed argmax (`DS4_MTP_VOCAB_SHARD`) |
 | `vllm/models/deepseek_v4/attention.py` | +32/-4 | MLA / sparse-attention wiring |
 | `vllm/models/deepseek_v4/common/ops/cache_utils.py` | +43 | KV-cache helpers (fp8_ds_mla latents) |
 | `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py` | +101/-40 | fused compress+quant of the MLA KV latent (UE8M0 fp8) |
@@ -33,9 +33,9 @@ modules and the aiter config).
 | file | Δ | purpose |
 |---|---|---|
 | `vllm/model_executor/layers/sparse_attn_indexer.py` | +1/-1 | route to the official indexer path |
-| `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py` | +261/-146 | ROCm sparse-MLA top-512 attention, writer-aware indexer-cache layout, deterministic selection/order, and bounded prefill JIT specialization (largest rewrite) |
+| `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py` | +288/-148 | ROCm sparse-MLA top-512 attention, writer-aware indexer-cache layout, deterministic selection/order, and bounded prefill JIT specialization (largest rewrite); `DS4_FUSE_ATTN_OUT` decode reduce kernel writes the caller's output buffer directly |
 | `ds4_topk.py` *(venv top-level)* | **new (457)** | deterministic radix-select top-k for the sparse indexer: ascending output removes the second sort, no full-row sort, no transient scratch. 2.7x at decode 128K, 10.2x at prefill 228K. `DS4_TOPK=0` restores the two-sort path |
-| `ds4_tl_indexer.py` *(venv top-level)* | **new (476)** | TileLang indexer + official QAT scoring (`DS4_IDX_OFFICIAL`); also the `w8a8_block_fp8_bf16` fast GEMM helper, which serves decode and (reusing the cache decode populates) prefill |
+| `ds4_tl_indexer.py` *(venv top-level)* | **new (614)** | TileLang indexer + official QAT scoring (`DS4_IDX_OFFICIAL`); also the `w8a8_block_fp8_bf16` fast GEMM helper, which serves decode and (reusing the cache decode populates) prefill; `DS4_FUSE_IDXGATHER` fused decode gather+dequant+pad |
 | `ds4_synctrace.py` *(venv top-level)* | **new (93)** | attributes blocking device->host syncs to python call sites by wrapping only the Tensor methods that can force a D2H (~25 events/step, versus ~3,200 for `with_stack=True`, which pegs the worker). Driven from `ds4_tl_indexer._maybe_profile`, so it shares the `DS4_PROFILE` window and needs no new env var |
 | `ds4_expert_union.py` *(venv top-level)* | **new (128)** | `DS4_EXPERT_UNION=1` probe: counts DISTINCT experts per MoE routing call, to measure the expert union a decode step actually touches (the free term in the decode roof). Wraps `make_routing_data`; vLLM's own `--enable-return-routed-experts` cannot see this model, whose routing never reaches `BaseRouter.route()`. Device-only accumulation, no per-step sync. Inert unless enabled |
 
@@ -49,10 +49,22 @@ modules and the aiter config).
 | `vllm/model_executor/kernels/linear/scaled_mm/triton.py` | +83 | `DS4_W8A8_BF16` fast bf16 GEMM path (via ds4_tl_indexer), plus `DS4_W8A8_BF16_DIRECT` which skips the caller-side fp8 quantisation the bf16 path immediately undoes; DS4 flags latched at import instead of per call |
 | `aiter/ops/triton/configs/gemm/gfx1151-GEMM-A8W8_BLOCKSCALE.json` | **new (15)** | tuned A8W8 blockscale GEMM config for gfx1151 |
 
+## Decode kernel dispatch / fusion
+| file | Δ | purpose |
+|---|---|---|
+| `vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py` | +19 | `DS4_TINY_ROUTING` hook: route tiny decode batches through the single-kernel MoE routing in `ds4_tiny_routing` |
+| `ds4_tiny_routing.py` *(venv top-level)* | **new (174)** | single-kernel MoE routing for tiny decode batches (replaces the 5-launch bitmatrix pipeline; bit-exact, cached output buffers). `DS4_TINY_ROUTING=1` enables |
+| `vllm/__init__.py` | +12 | import hook for the `DS4_FAST_TRITON` cached Triton launcher |
+| `ds4_fast_triton.py` *(venv top-level)* | **new (217)** | per-callsite cached fast path for `JITFunction.run`: caches the compiled kernel + grid per specialization key and relaunches via `CompiledKernel.run`, skipping the binder/specialization Python. The key strictly refines triton's own specialization inputs, so a hit can never select a different kernel. `DS4_FAST_TRITON=1` enables |
+| `vllm/model_executor/layers/activation.py` | +29 | `DS4_FUSE_SILU`: `SiluAndMulWithClamp` clamp/clamp/silu/mul as one triton kernel (bit-exact, per-op rounding preserved) |
+| `ds4_fused_glue.py` *(venv top-level)* | **new (455)** | fused decode-glue triton kernels, all bit-exact vs the aten chains they replace: silu+mul+clamp, indexer paged-cache gather+dequant+pad, decode topk ragged build, and the DSpark drafter rope/fp8-QAT/concat/ring-scatter chains. Gated per call site (`DS4_FUSE_*` / `DS4_MTP_FUSE_GLUE`, default ON) |
+| `ds4-tunableop0.csv` *(venv top-level)* | **new (15)** | tuned hipblaslt algo picks for the attn_o `wo_b` decode GEMM (bf16 TN 4096×n×4096); read by torch TunableOp via the `PYTORCH_TUNABLEOP_*` env in `host/ds4-cluster-env.sh` (tuning off, read-only; shapes absent from the CSV keep the stock heuristic) |
+
 ## Distributed all-reduce over Thunderbolt-4 RDMA
 | file | Δ | purpose |
 |---|---|---|
 | `vllm/distributed/device_communicators/cuda_communicator.py` | +51 | hook `DS4_TBV_AR` / `DS4_TBV_AR2` custom all-reduce |
+| `vllm/distributed/communication_op.py` | +25/-2 | route `tensor_model_parallel_all_reduce` through a functional cudagraph eager break so graph replays keep the fast eager all-reduce instead of a baked RCCL fallback |
 | `tbv_ar.py` *(venv top-level)* | **new (255)** | v1 TB4-RDMA all-reduce (GPU dma-buf MRs) |
 | `tbv_ar2.py` *(venv top-level)* | **new (69)** | v2 GPU-poll + progress-thread all-reduce (~105 µs) |
 
@@ -62,8 +74,8 @@ modules and the aiter config).
 | `vllm/v1/core/kv_cache_utils.py` | +62/-1 | KV-cache accounting (fp8_ds_mla, hybrid manager) |
 | `vllm/v1/core/sched/scheduler.py` | +42 | scheduler tweak |
 | `vllm/v1/worker/gpu_model_runner.py` | +8 | model-runner hook |
-| `vllm/compilation/breakable_cudagraph.py` | +18/-2 | piecewise cudagraph, keeps attention + custom all-reduce eager |
-| `vllm/v1/spec_decode/llm_base_proposer.py` | +36/-1 | MTP proposer adjustment |
+| `vllm/compilation/breakable_cudagraph.py` | +147/-5 | piecewise cudagraph, keeps attention + custom all-reduce eager; call-time (not import-time) enable gating for prestarted workers, padding-row zeroing after replayed eager segments, functional eager break for out-of-place ops |
+| `vllm/v1/spec_decode/llm_base_proposer.py` | +74/-6 | MTP proposer adjustment; `DS4_MTP_FAST_REPLAY` skips dead per-iteration work for stash-style drafters |
 
 ## Disk KV cache (`fs_lru`, distributed)
 | file | Δ | purpose |
